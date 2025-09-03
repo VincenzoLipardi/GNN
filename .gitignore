@@ -5,6 +5,10 @@ __pycache__/
 
 # C extensions
 *.so
+# directories
+data/dataset_random/
+data/dataset_tim/
+
 
 # Distribution / packaging
 .Python
