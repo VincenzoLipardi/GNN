@@ -9,11 +9,10 @@ from torch import nn, Tensor
 from torch.optim import Adam
 from torch.utils.data import random_split
 
-try:
-    from torch_geometric.nn import TransformerConv, global_mean_pool
-    from torch_geometric.loader import DataLoader
-except Exception as exc:  # pragma: no cover
-    raise ImportError("torch-geometric is required. Install 'torch-geometric'.") from exc
+
+from torch_geometric.nn import TransformerConv, global_mean_pool
+from torch_geometric.loader import DataLoader
+
 
 # Support running as a script or module
 try:
@@ -256,6 +255,13 @@ def build_train_test_loaders(
     )
 
 
+def subsample_paths(paths: List[str], fraction: float, seed: int = 42) -> List[str]:
+    import random
+    rnd = random.Random(seed)
+    n = max(1, int(len(paths) * fraction))
+    return rnd.sample(paths, n)
+
+
 @torch.no_grad()
 def evaluate_by_qubits(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[int, float]:
     model.eval()
@@ -298,20 +304,139 @@ def plot_mse_histogram(results: Dict[str, Dict[int, float]], save_path: str):
     plt.close()
 
 
+def plot_model_mse_bars(model_name: str, train_mse: float, test_mse: float, extra_mse: float, save_path: str):
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    xs = [model_name]
+    width = 0.25
+    x_idx = np.arange(len(xs))
+
+    plt.figure(figsize=(6, 5))
+    plt.bar(x_idx - width, [train_mse], width=width, label='Train MSE')
+    plt.bar(x_idx, [test_mse], width=width, label='Test MSE')
+    plt.bar(x_idx + width, [extra_mse], width=width, label='Extrapolation MSE')
+    plt.xticks(x_idx, xs)
+    plt.ylabel('Mean Squared Error')
+    plt.title('Model Performance (ID vs OOD)')
+    plt.legend()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+
+@torch.no_grad()
+def evaluate_overall_mse(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    total_se = 0.0
+    total_n = 0
+    for batch in loader:
+        batch = batch.to(device)
+        pred = model(batch)
+        y = batch.y.view(-1)
+        se = torch.sum((pred - y) ** 2).item()
+        total_se += se
+        total_n += y.numel()
+    return total_se / max(1, total_n)
+
+
+def save_checkpoint(model: nn.Module, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(model.state_dict(), path)
+
+
+def load_checkpoint_if_exists(model: nn.Module, path: str) -> bool:
+    if os.path.exists(path):
+        model.load_state_dict(torch.load(path, map_location='cpu'))
+        return True
+    return False
+
+
+def grid_search(
+    pkl_paths: List[str],
+    configs: List[Dict[str, int]],
+    train_split: float = 0.8,
+    epochs: int = 10,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    seed: int = 42,
+) -> List[Dict[str, float]]:
+    train_loader, val_loader = build_train_test_loaders(pkl_paths, train_split=train_split, batch_size=batch_size, seed=seed)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    criterion = nn.HuberLoss()
+    results = []
+
+    for cfg in configs:
+        model = CircuitGNN(
+            node_in_dim=12,
+            gnn_hidden=cfg.get('gnn_hidden', 64),
+            gnn_heads=cfg.get('gnn_heads', 4),
+            global_in_dim=8,
+            global_hidden=cfg.get('global_hidden', 64),
+            reg_hidden=cfg.get('reg_hidden', 128),
+        ).to(dev)
+        optimizer = Adam(model.parameters(), lr=lr)
+
+        for _ in range(epochs):
+            model.train()
+            for batch in train_loader:
+                batch = batch.to(dev)
+                pred = model(batch)
+                loss = criterion(pred, batch.y.view(-1))
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+        val_mse = evaluate_overall_mse(model, val_loader, dev)
+        res = {**cfg, 'val_mse': float(val_mse)}
+        results.append(res)
+
+    results.sort(key=lambda r: r['val_mse'])
+    return results
+
+
+def save_grid_table(results: List[Dict[str, float]], path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    headers = ['gnn_hidden', 'gnn_heads', 'global_hidden', 'reg_hidden', 'val_mse']
+    lines = ["\t".join(headers)]
+    for r in results:
+        line = "\t".join(str(r.get(h)) for h in headers)
+        lines.append(line)
+    with open(path, 'w') as f:
+        f.write("\n".join(lines))
+
+
 if __name__ == "__main__":
     base = "/Users/vlipardi/Documents/Github/ML/GNN/data/dataset_random"
+    # Collect in-distribution files (2-5 qubits)
+    in_dist_pkls_full = collect_pkls_by_qubits(base, [2, 3, 4, 5])
 
-    # In-distribution: qubits 2-5, 80/20 split
-    in_dist_pkls = collect_pkls_by_qubits(base, [2, 3, 4, 5])
-    train_loader, test_loader = build_train_test_loaders(in_dist_pkls, train_split=0.8, batch_size=64)
+    # 1) GRID SEARCH on 50% random subset
+    sample_pkls = subsample_paths(in_dist_pkls_full, fraction=0.5, seed=42)
+    configs = [
+        {'gnn_hidden': 32, 'gnn_heads': 2, 'global_hidden': 32, 'reg_hidden': 64},
+        {'gnn_hidden': 64, 'gnn_heads': 2, 'global_hidden': 64, 'reg_hidden': 128},
+        {'gnn_hidden': 64, 'gnn_heads': 4, 'global_hidden': 64, 'reg_hidden': 128},
+        {'gnn_hidden': 128, 'gnn_heads': 4, 'global_hidden': 128, 'reg_hidden': 256},
+    ]
+    grid_results = grid_search(sample_pkls, configs, train_split=0.8, epochs=10, batch_size=64, lr=1e-3, seed=42)
+    table_path = os.path.join(os.getcwd(), 'results', 'grid_search.tsv')
+    save_grid_table(grid_results, table_path)
+    best_cfg = {k: grid_results[0][k] for k in ['gnn_hidden', 'gnn_heads', 'global_hidden', 'reg_hidden']}
+    print(f"Best config: {best_cfg} | Val MSE: {grid_results[0]['val_mse']:.6f}. Table saved to {table_path}")
 
-    # Train model
+    # 2) TRAIN BEST on full in-distribution data and evaluate
+    train_loader, test_loader = build_train_test_loaders(in_dist_pkls_full, train_split=0.8, batch_size=64)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CircuitGNN().to(dev)
+    model = CircuitGNN(
+        gnn_hidden=int(best_cfg['gnn_hidden']),
+        gnn_heads=int(best_cfg['gnn_heads']),
+        global_hidden=int(best_cfg['global_hidden']),
+        reg_hidden=int(best_cfg['reg_hidden']),
+    ).to(dev)
     criterion = nn.HuberLoss()
     optimizer = Adam(model.parameters(), lr=1e-3)
-
-    # Simple training loop (no val here since we only need train/test for this task)
     epochs = 20
     for epoch in range(1, epochs + 1):
         model.train()
@@ -326,22 +451,16 @@ if __name__ == "__main__":
             total_loss += loss.item() * batch.num_graphs
         print(f"Epoch {epoch:03d} | TrainLoss {total_loss/len(train_loader.dataset):.4f}")
 
-    # Evaluate on train and test by qubit count
-    train_mse = evaluate_by_qubits(model, train_loader, dev)
-    test_mse = evaluate_by_qubits(model, test_loader, dev)
+    train_mse_overall = evaluate_overall_mse(model, train_loader, dev)
+    test_mse_overall = evaluate_overall_mse(model, test_loader, dev)
 
-    # Extrapolation: evaluate on 6-qubit files
+    # 3) OOD on 6-qubit circuits
     ex_pkls = collect_pkls_by_qubits(base, [6])
     _, extra_loader = build_train_test_loaders(ex_pkls, train_split=0.0, batch_size=64)
-    extra_mse = evaluate_by_qubits(model, extra_loader, dev)
+    extra_mse_overall = evaluate_overall_mse(model, extra_loader, dev)
 
-    results = {
-        'train': train_mse,
-        'test': test_mse,
-        'extrapolation': extra_mse,
-    }
-
-    out_path = os.path.join(os.getcwd(), 'results', 'mse_by_qubits.png')
-    plot_mse_histogram(results, out_path)
-    print(f"Saved histogram to {out_path}")
+    # Final bar plot (single model)
+    out_bar = os.path.join(os.getcwd(), 'results', 'model_mse_bars.png')
+    plot_model_mse_bars('CircuitGNN', train_mse_overall, test_mse_overall, extra_mse_overall, out_bar)
+    print(f"Saved model bar histogram to {out_bar} and grid table to {table_path}")
 
