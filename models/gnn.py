@@ -2,30 +2,51 @@ import os
 import sys
 import hashlib
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 
 import torch
 from torch import nn, Tensor
+import torch.nn.functional as F
 from torch.optim import Adam
-from torch.utils.data import random_split
-
-
-from torch_geometric.nn import TransformerConv, global_mean_pool
 from torch_geometric.loader import DataLoader
-
-
-# Support running as a script or module
+from torch.utils.data import random_split
 try:
-    from .graph_representation import QuantumCircuitGraphDataset  # type: ignore
+    from torch.amp import autocast, GradScaler  # type: ignore[attr-defined]
+    _AMP_DEVICE_TYPE = 'cuda'
 except Exception:
-    try:
-        from models.graph_representation import QuantumCircuitGraphDataset  # type: ignore
-    except Exception:
-        # Add project root to sys.path, then retry
-        project_root = Path(__file__).resolve().parents[1]
-        if str(project_root) not in sys.path:
-            sys.path.append(str(project_root))
-        from models.graph_representation import QuantumCircuitGraphDataset  # type: ignore
+    from torch.cuda.amp import autocast, GradScaler  # type: ignore
+    _AMP_DEVICE_TYPE = 'cuda'
+
+# Ensure project root on sys.path when executed directly
+try:
+    from .graph_representation import QuantumCircuitGraphDataset
+except Exception:
+    project_root = Path(__file__).resolve().parents[1]
+    if str(project_root) not in sys.path:
+        sys.path.append(str(project_root))
+    from models.graph_representation import QuantumCircuitGraphDataset
+
+
+
+
+# =========================================
+# Data utils (cache path)
+# =========================================
+def _cache_root_for_paths(paths: List[str], suffix: str = "") -> str:
+    canonical = "|".join(sorted(os.path.abspath(p) for p in paths))
+    digest = hashlib.md5(canonical.encode("utf-8")).hexdigest()[:10]
+    tag = f"_{suffix}" if suffix else ""
+    return os.path.join(os.getcwd(), f"pyg_cache_{digest}{tag}")
+
+
+
+# =========================================
+# Architecture (GNN model)
+# =========================================
+GNN_HIDDEN = 32
+GNN_HEADS = 2
+GLOBAL_HIDDEN = 64
+REG_HIDDEN = 128
 
 
 class GlobalMLP(nn.Module):
@@ -60,19 +81,25 @@ class RegressorHead(nn.Module):
 
 
 class CircuitGNN(nn.Module):
-    """GNN with 3 TransformerConv layers, global branch, and regressor."""
+    """GNN with TransformerConv layers, global branch, and regressor."""
 
     def __init__(
         self,
-        node_in_dim: int = 12,
-        gnn_hidden: int = 64,
-        gnn_heads: int = 4,
+        node_in_dim: int = 13,
+        gnn_hidden: int = GNN_HIDDEN,
+        gnn_heads: int = GNN_HEADS,
         global_in_dim: int = 8,
-        global_hidden: int = 64,
-        reg_hidden: int = 128,
+        global_hidden: int = GLOBAL_HIDDEN,
+        reg_hidden: int = REG_HIDDEN,
     ):
         super().__init__()
 
+        from torch_geometric.nn import TransformerConv, global_mean_pool  # lazy import to avoid hard dep at import time
+
+        self.global_mean_pool = global_mean_pool
+
+        self.gnn_hidden = gnn_hidden
+        self.gnn_heads = gnn_heads
         self.conv1 = TransformerConv(node_in_dim, gnn_hidden, heads=gnn_heads, dropout=0.0, beta=False)
         self.conv2 = TransformerConv(gnn_hidden * gnn_heads, gnn_hidden, heads=gnn_heads, dropout=0.0, beta=False)
         self.conv3 = TransformerConv(gnn_hidden * gnn_heads, gnn_hidden, heads=gnn_heads, dropout=0.0, beta=False)
@@ -85,14 +112,18 @@ class CircuitGNN(nn.Module):
         x, edge_index, batch = data.x, data.edge_index, getattr(data, 'batch', None)
         if batch is None:
             batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-
-        x = self.conv1(x, edge_index)
-        x = torch.relu(x)
-        x = self.conv2(x, edge_index)
-        x = torch.relu(x)
-        x = self.conv3(x, edge_index)
-        x = torch.relu(x)
-        x_pool = global_mean_pool(x, batch)
+        # Early handle graphs with zero nodes to avoid NaNs in TransformerConv
+        if x.size(0) == 0:
+            num_graphs = getattr(data, 'num_graphs', 1)
+            x_pool = torch.zeros((num_graphs, self.gnn_hidden * self.gnn_heads), device=x.device, dtype=x.dtype)
+        else:
+            x = self.conv1(x, edge_index)
+            x = F.relu(x)
+            x = self.conv2(x, edge_index)
+            x = F.relu(x)
+            x = self.conv3(x, edge_index)
+            x = F.relu(x)
+            x_pool = self.global_mean_pool(x, batch)
 
         # Reshape concatenated global features back to [num_graphs, feat_dim]
         g_raw = data.global_features
@@ -115,21 +146,26 @@ class CircuitGNN(nn.Module):
         return out.view(-1)
 
 
-def _cache_root_for_paths(paths: List[str]) -> str:
-    canonical = "|".join(sorted(os.path.abspath(p) for p in paths))
-    digest = hashlib.md5(canonical.encode("utf-8")).hexdigest()[:10]
-    return os.path.join(os.getcwd(), f"pyg_cache_{digest}")
-
-
+# =========================================
+# Loaders
+# =========================================
 def build_dataloader(
     pkl_paths: List[str],
     batch_size: int = 32,
     val_split: float = 0.2,
     test_split: float = 0.1,
     seed: int = 42,
+    global_feature_variant: str = "baseline",
+    node_feature_backend_variant: Optional[str] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    root = _cache_root_for_paths(pkl_paths)
-    dataset = QuantumCircuitGraphDataset(root=root, pkl_paths=pkl_paths)
+    suffix = f"{global_feature_variant}_backend_{node_feature_backend_variant or 'none'}"
+    root = _cache_root_for_paths(pkl_paths, suffix=suffix)
+    dataset = QuantumCircuitGraphDataset(
+        root=root,
+        pkl_paths=pkl_paths,
+        global_feature_variant=global_feature_variant,
+        node_feature_backend_variant=node_feature_backend_variant,
+    )
 
     if len(dataset) == 0:
         raise RuntimeError("Dataset is empty. Check PKL paths and formats.")
@@ -137,99 +173,19 @@ def build_dataloader(
     test_len = max(1, int(len(dataset) * test_split))
     val_len = max(1, int(len(dataset) * val_split))
     train_len = max(1, len(dataset) - val_len - test_len)
-    # Adjust to exact total
     while train_len + val_len + test_len > len(dataset):
         train_len -= 1
     generator = torch.Generator().manual_seed(seed)
     train_ds, val_ds, test_ds = random_split(dataset, [train_len, val_len, test_len], generator=generator)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    # Efficient loader defaults
+    num_cpus = os.cpu_count() or 0
+    default_workers = 2 if num_cpus > 2 else 0
+    pin_mem = torch.cuda.is_available()
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=default_workers, pin_memory=pin_mem)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=default_workers, pin_memory=pin_mem)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=default_workers, pin_memory=pin_mem)
     return train_loader, val_loader, test_loader
-
-
-def train(
-    pkl_paths: List[str],
-    epochs: int = 20,
-    lr: float = 1e-3,
-    batch_size: int = 32,
-    device: Optional[str] = None,
-):
-    train_loader, val_loader, test_loader = build_dataloader(pkl_paths, batch_size=batch_size, val_split=0.2, test_split=0.1)
-
-    model = CircuitGNN()
-    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model.to(dev)
-
-    criterion = nn.HuberLoss()
-    optimizer = Adam(model.parameters(), lr=lr)
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = 0.0
-        for batch in train_loader:
-            batch = batch.to(dev)
-            pred = model(batch)
-            if getattr(batch, 'y', None) is None:
-                raise RuntimeError("Labels 'y' are missing in dataset. Ensure PKLs are labeled.")
-            loss = criterion(pred, batch.y.view(-1))
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * batch.num_graphs
-
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = batch.to(dev)
-                pred = model(batch)
-                loss = criterion(pred, batch.y.view(-1))
-                val_loss += loss.item() * batch.num_graphs
-
-        print(f"Epoch {epoch:03d} | TrainLoss {total_loss/len(train_loader.dataset):.4f} | "
-              f"ValLoss {val_loss/len(val_loader.dataset):.4f}")
-
-    # Test evaluation
-    model.eval()
-    criterion = nn.HuberLoss()
-    test_loss = 0.0
-    mae = 0.0
-    n = 0
-    with torch.no_grad():
-        for batch in test_loader:
-            batch = batch.to(dev)
-            pred = model(batch)
-            loss = criterion(pred, batch.y.view(-1))
-            test_loss += loss.item() * batch.num_graphs
-            mae += torch.mean(torch.abs(pred - batch.y.view(-1))).item() * batch.num_graphs
-            n += batch.num_graphs
-    print(f"TestLoss {test_loss/max(1,n):.4f} | TestMAE {mae/max(1,n):.4f}")
-
-    return model
-
-
-def collect_all_random_pkls(base_dir: str) -> List[str]:
-    files = []
-    for name in sorted(os.listdir(base_dir)):
-        if name.endswith('.pkl') and 'basis_rotations+cx_qubits_' in name:
-            files.append(os.path.join(base_dir, name))
-    if not files:
-        raise FileNotFoundError(f"No PKL files found in {base_dir}")
-    return files
-
-
-def collect_pkls_by_qubits(base_dir: str, qubits: List[int]) -> List[str]:
-    selected = []
-    for q in qubits:
-        key = f"qubits_{q}_"
-        for name in sorted(os.listdir(base_dir)):
-            if name.endswith('.pkl') and 'basis_rotations+cx_qubits_' in name and key in name:
-                selected.append(os.path.join(base_dir, name))
-    if not selected:
-        raise FileNotFoundError(f"No PKLs for qubits {qubits} in {base_dir}")
-    return selected
 
 
 def build_train_test_loaders(
@@ -237,93 +193,220 @@ def build_train_test_loaders(
     train_split: float = 0.8,
     batch_size: int = 64,
     seed: int = 42,
+    global_feature_variant: str = "baseline",
+    node_feature_backend_variant: Optional[str] = None,
 ) -> Tuple[DataLoader, DataLoader]:
-    root = _cache_root_for_paths(pkl_paths)
-    dataset = QuantumCircuitGraphDataset(root=root, pkl_paths=pkl_paths)
+    suffix = f"{global_feature_variant}_backend_{node_feature_backend_variant or 'none'}"
+    root = _cache_root_for_paths(pkl_paths, suffix=suffix)
+    dataset = QuantumCircuitGraphDataset(
+        root=root,
+        pkl_paths=pkl_paths,
+        global_feature_variant=global_feature_variant,
+        node_feature_backend_variant=node_feature_backend_variant,
+    )
     if len(dataset) < 2:
         raise RuntimeError("Dataset too small to split. Check PKLs.")
     train_len = max(1, int(len(dataset) * train_split))
     test_len = max(1, len(dataset) - train_len)
-    # Adjust
     while train_len + test_len > len(dataset):
         train_len -= 1
     generator = torch.Generator().manual_seed(seed)
     train_ds, test_ds = random_split(dataset, [train_len, test_len], generator=generator)
+    num_cpus = os.cpu_count() or 0
+    default_workers = 2 if num_cpus > 2 else 0
+    pin_mem = torch.cuda.is_available()
     return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True),
-        DataLoader(test_ds, batch_size=batch_size, shuffle=False),
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=default_workers, pin_memory=pin_mem),
+        DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=default_workers, pin_memory=pin_mem),
     )
 
 
-def subsample_paths(paths: List[str], fraction: float, seed: int = 42) -> List[str]:
-    import random
-    rnd = random.Random(seed)
-    n = max(1, int(len(paths) * fraction))
-    return rnd.sample(paths, n)
+def build_full_loader(
+    pkl_paths: List[str],
+    batch_size: int = 64,
+    global_feature_variant: str = "baseline",
+    node_feature_backend_variant: Optional[str] = None,
+):
+    suffix = f"{global_feature_variant}_backend_{node_feature_backend_variant or 'none'}"
+    root = _cache_root_for_paths(pkl_paths, suffix=suffix)
+    dataset = QuantumCircuitGraphDataset(
+        root=root,
+        pkl_paths=pkl_paths,
+        global_feature_variant=global_feature_variant,
+        node_feature_backend_variant=node_feature_backend_variant,
+    )
+    if len(dataset) == 0:
+        raise RuntimeError("Dataset is empty. Check PKL paths and formats.")
+    num_cpus = os.cpu_count() or 0
+    default_workers = 2 if num_cpus > 2 else 0
+    pin_mem = torch.cuda.is_available()
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=default_workers, pin_memory=pin_mem)
 
 
-@torch.no_grad()
-def evaluate_by_qubits(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[int, float]:
+def build_train_val_test_loaders_two_stage(
+    pkl_paths: List[str],
+    train_split: float = 0.8,
+    val_within_train: float = 0.1,
+    batch_size: int = 32,
+    seed: int = 42,
+    global_feature_variant: str = "baseline",
+    node_feature_backend_variant: Optional[str] = None,
+):
+    suffix = f"{global_feature_variant}_backend_{node_feature_backend_variant or 'none'}"
+    root = _cache_root_for_paths(pkl_paths, suffix=suffix)
+    dataset = QuantumCircuitGraphDataset(
+        root=root,
+        pkl_paths=pkl_paths,
+        global_feature_variant=global_feature_variant,
+        node_feature_backend_variant=node_feature_backend_variant,
+    )
+    if len(dataset) < 3:
+        raise RuntimeError("Dataset too small for train/val/test splitting.")
+
+    generator = torch.Generator().manual_seed(seed)
+    primary_train_len = max(1, int(len(dataset) * train_split))
+    test_len = max(1, len(dataset) - primary_train_len)
+    while primary_train_len + test_len > len(dataset):
+        primary_train_len -= 1
+
+    primary_train, test_ds = random_split(dataset, [primary_train_len, test_len], generator=generator)
+    val_len = max(1, int(len(primary_train) * val_within_train))
+    real_train_len = max(1, len(primary_train) - val_len)
+    train_ds, val_ds = random_split(primary_train, [real_train_len, val_len], generator=generator)
+
+    num_cpus = os.cpu_count() or 0
+    default_workers = 2 if num_cpus > 2 else 0
+    pin_mem = torch.cuda.is_available()
+    return (
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=default_workers, pin_memory=pin_mem),
+        DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=default_workers, pin_memory=pin_mem),
+        DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=default_workers, pin_memory=pin_mem),
+    )
+
+
+# =========================================
+# Training
+# =========================================
+def train(
+    pkl_paths: List[str],
+    epochs: int = 200,
+    lr: float = 1e-3,
+    batch_size: int = 32,
+    device: Optional[str] = None,
+    global_feature_variant: str = "baseline",
+    node_feature_backend_variant: Optional[str] = None,
+    early_stopping_patience: int = 20,
+    early_stopping_min_delta: float = 0.0,
+    model_kwargs: Optional[Dict[str, Any]] = None,
+):
+    train_loader, val_loader, test_loader = build_dataloader(
+        pkl_paths,
+        batch_size=batch_size,
+        val_split=0.2,
+        test_split=0.1,
+        global_feature_variant=global_feature_variant,
+        node_feature_backend_variant=node_feature_backend_variant,
+    )
+
+    gdim = 152 if global_feature_variant == "binned152" else 8
+    model_args = dict(global_in_dim=gdim)
+    # Determine node feature dimension
+    node_in_dim = 13 + (7 if node_feature_backend_variant else 0)
+    model_args.update(dict(node_in_dim=node_in_dim))
+    if model_kwargs:
+        model_args.update(model_kwargs)
+        model_args.setdefault('global_in_dim', gdim)
+        model_args.setdefault('node_in_dim', node_in_dim)
+    model = CircuitGNN(**model_args)
+    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if dev.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+    model.to(dev)
+
+    criterion = nn.HuberLoss()
+    optimizer = Adam(model.parameters(), lr=lr)
+
+    best_val = float('inf')
+    best_state = None
+    epochs_without_improve = 0
+
+    # Initialize AMP scaler (fallback to CUDA AMP if torch.amp not available)
+    try:
+        scaler = GradScaler(device=_AMP_DEVICE_TYPE, enabled=(dev.type == 'cuda'))
+    except TypeError:
+        scaler = GradScaler(enabled=(dev.type == 'cuda'))
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        for batch in train_loader:
+            batch = batch.to(dev, non_blocking=True)
+            if getattr(batch, 'y', None) is None:
+                raise RuntimeError("Labels 'y' are missing in dataset. Ensure PKLs are labeled.")
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(_AMP_DEVICE_TYPE, enabled=(dev.type == 'cuda')):
+                pred = model(batch)
+                target = batch.y.view(-1)
+                mask = torch.isfinite(target)
+                if mask.sum() == 0:
+                    continue
+                loss = criterion(pred[mask], target[mask])
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.detach().item() * int(mask.sum().item())
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = batch.to(dev, non_blocking=True)
+                with autocast(_AMP_DEVICE_TYPE, enabled=(dev.type == 'cuda')):
+                    pred = model(batch)
+                    target = batch.y.view(-1)
+                    mask = torch.isfinite(target)
+                    if mask.sum() == 0:
+                        continue
+                    loss = criterion(pred[mask], target[mask])
+                val_loss += loss.detach().item() * int(mask.sum().item())
+
+        train_loss_epoch = total_loss/max(1, len(train_loader.dataset))
+        val_loss_epoch = val_loss/max(1, len(val_loader.dataset))
+        print(f"Epoch {epoch:03d} | TrainLoss {train_loss_epoch:.4f} | ValLoss {val_loss_epoch:.4f}")
+
+        if val_loss_epoch + early_stopping_min_delta < best_val:
+            best_val = val_loss_epoch
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improve = 0
+        else:
+            epochs_without_improve += 1
+            if epochs_without_improve >= early_stopping_patience:
+                print(f"Early stopping triggered at epoch {epoch:03d} (best ValLoss {best_val:.4f}).")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
     model.eval()
-    mse_per_q: Dict[int, List[float]] = {}
-    for batch in loader:
-        batch = batch.to(device)
-        pred = model(batch)
-        y = batch.y.view(-1)
-        se = (pred - y) ** 2
-        qubits = batch.num_qubits.view(-1).tolist()
-        for i, q in enumerate(qubits):
-            mse_per_q.setdefault(int(q), []).append(float(se[i].item()))
-    return {q: float(torch.tensor(vals).mean().item()) for q, vals in mse_per_q.items()}
+    criterion = nn.HuberLoss()
+    test_loss = 0.0
+    mae = 0.0
+    n = 0
+    with torch.no_grad():
+        for batch in test_loader:
+            batch = batch.to(dev, non_blocking=True)
+            with autocast(_AMP_DEVICE_TYPE, enabled=(dev.type == 'cuda')):
+                pred = model(batch)
+                target = batch.y.view(-1)
+                mask = torch.isfinite(target)
+                if mask.sum() == 0:
+                    continue
+                loss = criterion(pred[mask], target[mask])
+            test_loss += loss.detach().item() * int(mask.sum().item())
+            mae += torch.mean(torch.abs(pred[mask] - target[mask])).item() * int(mask.sum().item())
+            n += int(mask.sum().item())
+    print(f"TestLoss {test_loss/max(1,n):.4f} | TestMAE {mae/max(1,n):.4f}")
 
-
-def plot_mse_histogram(results: Dict[str, Dict[int, float]], save_path: str):
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    xs = [2, 3, 4, 5, 6]
-    train_vals = [results.get('train', {}).get(k, np.nan) for k in xs]
-    test_vals = [results.get('test', {}).get(k, np.nan) for k in xs]
-    extra_vals = [results.get('extrapolation', {}).get(k, np.nan) for k in xs]
-
-    width = 0.25
-    x_idx = np.arange(len(xs))
-
-    plt.figure(figsize=(10, 5))
-    plt.bar(x_idx - width, train_vals, width=width, label='Train MSE')
-    plt.bar(x_idx, test_vals, width=width, label='Test MSE')
-    plt.bar(x_idx + width, extra_vals, width=width, label='Extrapolation MSE')
-    plt.xticks(x_idx, xs)
-    plt.xlabel('Number of Qubits')
-    plt.ylabel('Mean Squared Error')
-    plt.title('MSE by Qubit Count (Train/Test/Extrapolation)')
-    plt.legend()
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
-    plt.close()
-
-
-def plot_model_mse_bars(model_name: str, train_mse: float, test_mse: float, extra_mse: float, save_path: str):
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    xs = [model_name]
-    width = 0.25
-    x_idx = np.arange(len(xs))
-
-    plt.figure(figsize=(6, 5))
-    plt.bar(x_idx - width, [train_mse], width=width, label='Train MSE')
-    plt.bar(x_idx, [test_mse], width=width, label='Test MSE')
-    plt.bar(x_idx + width, [extra_mse], width=width, label='Extrapolation MSE')
-    plt.xticks(x_idx, xs)
-    plt.ylabel('Mean Squared Error')
-    plt.title('Model Performance (ID vs OOD)')
-    plt.legend()
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
-    plt.close()
+    return model
 
 
 @torch.no_grad()
@@ -331,26 +414,19 @@ def evaluate_overall_mse(model: nn.Module, loader: DataLoader, device: torch.dev
     model.eval()
     total_se = 0.0
     total_n = 0
+    use_amp = (device.type == 'cuda')
     for batch in loader:
-        batch = batch.to(device)
-        pred = model(batch)
-        y = batch.y.view(-1)
-        se = torch.sum((pred - y) ** 2).item()
+        batch = batch.to(device, non_blocking=True)
+        with autocast(_AMP_DEVICE_TYPE, enabled=use_amp):
+            pred = model(batch)
+            y = batch.y.view(-1)
+            mask = torch.isfinite(y)
+            if mask.sum() == 0:
+                continue
+            se = torch.sum((pred[mask] - y[mask]) ** 2).item()
         total_se += se
-        total_n += y.numel()
+        total_n += int(mask.sum().item())
     return total_se / max(1, total_n)
-
-
-def save_checkpoint(model: nn.Module, path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(model.state_dict(), path)
-
-
-def load_checkpoint_if_exists(model: nn.Module, path: str) -> bool:
-    if os.path.exists(path):
-        model.load_state_dict(torch.load(path, map_location='cpu'))
-        return True
-    return False
 
 
 def grid_search(
@@ -361,20 +437,29 @@ def grid_search(
     batch_size: int = 64,
     lr: float = 1e-3,
     seed: int = 42,
+    global_feature_variant: str = "baseline",
+    node_feature_backend_variant: Optional[str] = None,
 ) -> List[Dict[str, float]]:
-    train_loader, val_loader = build_train_test_loaders(pkl_paths, train_split=train_split, batch_size=batch_size, seed=seed)
+    train_loader, val_loader = build_train_test_loaders(
+        pkl_paths,
+        train_split=train_split,
+        batch_size=batch_size,
+        seed=seed,
+        global_feature_variant=global_feature_variant,
+        node_feature_backend_variant=node_feature_backend_variant,
+    )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     criterion = nn.HuberLoss()
     results = []
 
     for cfg in configs:
         model = CircuitGNN(
-            node_in_dim=12,
-            gnn_hidden=cfg.get('gnn_hidden', 64),
-            gnn_heads=cfg.get('gnn_heads', 4),
-            global_in_dim=8,
-            global_hidden=cfg.get('global_hidden', 64),
-            reg_hidden=cfg.get('reg_hidden', 128),
+            node_in_dim=13 + (7 if node_feature_backend_variant else 0),
+            gnn_hidden=cfg.get('gnn_hidden', GNN_HIDDEN),
+            gnn_heads=cfg.get('gnn_heads', GNN_HEADS),
+            global_in_dim=(152 if global_feature_variant == "binned152" else 8),
+            global_hidden=cfg.get('global_hidden', GLOBAL_HIDDEN),
+            reg_hidden=cfg.get('reg_hidden', REG_HIDDEN),
         ).to(dev)
         optimizer = Adam(model.parameters(), lr=lr)
 
@@ -383,7 +468,11 @@ def grid_search(
             for batch in train_loader:
                 batch = batch.to(dev)
                 pred = model(batch)
-                loss = criterion(pred, batch.y.view(-1))
+                target = batch.y.view(-1)
+                mask = torch.isfinite(target)
+                if mask.sum() == 0:
+                    continue
+                loss = criterion(pred[mask], target[mask])
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -396,71 +485,107 @@ def grid_search(
     return results
 
 
-def save_grid_table(results: List[Dict[str, float]], path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    headers = ['gnn_hidden', 'gnn_heads', 'global_hidden', 'reg_hidden', 'val_mse']
-    lines = ["\t".join(headers)]
-    for r in results:
-        line = "\t".join(str(r.get(h)) for h in headers)
-        lines.append(line)
-    with open(path, 'w') as f:
-        f.write("\n".join(lines))
+def train_with_two_stage_split(
+    pkl_paths: List[str],
+    epochs: int = 200,
+    lr: float = 1e-3,
+    batch_size: int = 32,
+    device: Optional[str] = None,
+    global_feature_variant: str = "binned152",
+    node_feature_backend_variant: Optional[str] = None,
+    early_stopping_patience: int = 10,
+    early_stopping_min_delta: float = 0.0,
+    train_split: float = 0.8,
+    val_within_train: float = 0.1,
+    model_kwargs: Optional[Dict[str, Any]] = None,
+    seed: int = 42,
+):
+    train_loader, val_loader, test_loader = build_train_val_test_loaders_two_stage(
+        pkl_paths,
+        train_split=train_split,
+        val_within_train=val_within_train,
+        batch_size=batch_size,
+        seed=seed,
+        global_feature_variant=global_feature_variant,
+        node_feature_backend_variant=node_feature_backend_variant,
+    )
 
+    gdim = 152 if global_feature_variant == "binned152" else 8
+    model_args = dict(global_in_dim=gdim)
+    node_in_dim = 13 + (7 if node_feature_backend_variant else 0)
+    model_args.update(dict(node_in_dim=node_in_dim))
+    if model_kwargs:
+        model_args.update(model_kwargs)
+        model_args.setdefault('global_in_dim', gdim)
+        model_args.setdefault('node_in_dim', node_in_dim)
+    model = CircuitGNN(**model_args)
+    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if dev.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+    model.to(dev)
 
-if __name__ == "__main__":
-    base = "/Users/vlipardi/Documents/Github/ML/GNN/data/dataset_random"
-    # Collect in-distribution files (2-5 qubits)
-    in_dist_pkls_full = collect_pkls_by_qubits(base, [2, 3, 4, 5])
-
-    # 1) GRID SEARCH on 50% random subset
-    sample_pkls = subsample_paths(in_dist_pkls_full, fraction=0.5, seed=42)
-    configs = [
-        {'gnn_hidden': 32, 'gnn_heads': 2, 'global_hidden': 32, 'reg_hidden': 64},
-        {'gnn_hidden': 64, 'gnn_heads': 2, 'global_hidden': 64, 'reg_hidden': 128},
-        {'gnn_hidden': 64, 'gnn_heads': 4, 'global_hidden': 64, 'reg_hidden': 128},
-        {'gnn_hidden': 128, 'gnn_heads': 4, 'global_hidden': 128, 'reg_hidden': 256},
-    ]
-    grid_results = grid_search(sample_pkls, configs, train_split=0.8, epochs=10, batch_size=64, lr=1e-3, seed=42)
-    table_path = os.path.join(os.getcwd(), 'results', 'grid_search.tsv')
-    save_grid_table(grid_results, table_path)
-    best_cfg = {k: grid_results[0][k] for k in ['gnn_hidden', 'gnn_heads', 'global_hidden', 'reg_hidden']}
-    print(f"Best config: {best_cfg} | Val MSE: {grid_results[0]['val_mse']:.6f}. Table saved to {table_path}")
-
-    # 2) TRAIN BEST on full in-distribution data and evaluate
-    train_loader, test_loader = build_train_test_loaders(in_dist_pkls_full, train_split=0.8, batch_size=64)
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CircuitGNN(
-        gnn_hidden=int(best_cfg['gnn_hidden']),
-        gnn_heads=int(best_cfg['gnn_heads']),
-        global_hidden=int(best_cfg['global_hidden']),
-        reg_hidden=int(best_cfg['reg_hidden']),
-    ).to(dev)
     criterion = nn.HuberLoss()
-    optimizer = Adam(model.parameters(), lr=1e-3)
-    epochs = 20
+    optimizer = Adam(model.parameters(), lr=lr)
+
+    best_val = float('inf')
+    best_state = None
+    epochs_without_improve = 0
+
+    try:
+        scaler = GradScaler(device=_AMP_DEVICE_TYPE, enabled=(dev.type == 'cuda'))
+    except TypeError:
+        scaler = GradScaler(enabled=(dev.type == 'cuda'))
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
         for batch in train_loader:
-            batch = batch.to(dev)
-            pred = model(batch)
-            loss = criterion(pred, batch.y.view(-1))
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * batch.num_graphs
-        print(f"Epoch {epoch:03d} | TrainLoss {total_loss/len(train_loader.dataset):.4f}")
+            batch = batch.to(dev, non_blocking=True)
+            if getattr(batch, 'y', None) is None:
+                raise RuntimeError("Labels 'y' are missing in dataset. Ensure PKLs are labeled.")
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(_AMP_DEVICE_TYPE, enabled=(dev.type == 'cuda')):
+                pred = model(batch)
+                target = batch.y.view(-1)
+                mask = torch.isfinite(target)
+                if mask.sum() == 0:
+                    continue
+                loss = criterion(pred[mask], target[mask])
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.detach().item() * batch.num_graphs
 
-    train_mse_overall = evaluate_overall_mse(model, train_loader, dev)
-    test_mse_overall = evaluate_overall_mse(model, test_loader, dev)
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = batch.to(dev, non_blocking=True)
+                with autocast(_AMP_DEVICE_TYPE, enabled=(dev.type == 'cuda')):
+                    pred = model(batch)
+                    target = batch.y.view(-1)
+                    mask = torch.isfinite(target)
+                    if mask.sum() == 0:
+                        continue
+                    loss = criterion(pred[mask], target[mask])
+                val_loss += loss.detach().item() * batch.num_graphs
 
-    # 3) OOD on 6-qubit circuits
-    ex_pkls = collect_pkls_by_qubits(base, [6])
-    _, extra_loader = build_train_test_loaders(ex_pkls, train_split=0.0, batch_size=64)
-    extra_mse_overall = evaluate_overall_mse(model, extra_loader, dev)
+        train_loss_epoch = total_loss/max(1, len(train_loader.dataset))
+        val_loss_epoch = val_loss/max(1, len(val_loader.dataset))
+        print(f"Epoch {epoch:03d} | TrainLoss {train_loss_epoch:.4f} | ValLoss {val_loss_epoch:.4f}")
 
-    # Final bar plot (single model)
-    out_bar = os.path.join(os.getcwd(), 'results', 'model_mse_bars.png')
-    plot_model_mse_bars('CircuitGNN', train_mse_overall, test_mse_overall, extra_mse_overall, out_bar)
-    print(f"Saved model bar histogram to {out_bar} and grid table to {table_path}")
+        if val_loss_epoch + early_stopping_min_delta < best_val:
+            best_val = val_loss_epoch
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improve = 0
+        else:
+            epochs_without_improve += 1
+            if epochs_without_improve >= early_stopping_patience:
+                print(f"Early stopping triggered at epoch {epoch:03d} (best ValLoss {best_val:.4f}).")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return model, train_loader, val_loader, test_loader, dev
+    
 

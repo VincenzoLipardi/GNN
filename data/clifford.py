@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import qiskit
 from qiskit import QuantumCircuit
 from qiskit.quantum_info import Clifford, Operator, Statevector
@@ -364,7 +365,15 @@ def plot_scalability_histogram(scalability_data: dict, save_path: Optional[str])
         ax2.text(i, speedup, f'{speedup:.1f}x', ha='center', va='bottom', fontweight='bold')
     
     plt.tight_layout()
-    
+
+    # Ensure images are saved under the global results directory by default
+    results_dir = "/data/P70087789/GNN/models/results"
+    if not save_path:
+        save_path = os.path.join(results_dir, 'scalability_histogram.png')
+    elif not os.path.isabs(save_path):
+        save_path = os.path.join(results_dir, os.path.basename(save_path))
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"Plot saved to {save_path}")
 

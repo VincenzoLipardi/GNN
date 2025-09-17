@@ -64,7 +64,9 @@ def plot_histograms(entropy_data, num_qubits):
     plt.grid(True, alpha=0.3, linestyle='--')
     plt.tight_layout()
     
-    filename = directory+f"/images/magic_distribution_q_{num_qubits}.png"
+    results_dir = "/data/P70087789/GNN/models/results"
+    os.makedirs(results_dir, exist_ok=True)
+    filename = os.path.join(results_dir, f"magic_distribution_q_{num_qubits}.png")
     plt.savefig(filename)
     print("Image saved as:", filename)
     return stats, 
@@ -107,7 +109,9 @@ def plot_combined_histograms(directory, qubit_range, trotter_steps_list=None):
     
     plt.margins(y=0.15)
     
-    filename = directory+"/images/combined_magic_distribution.png"
+    results_dir = "/data/P70087789/GNN/models/results"
+    os.makedirs(results_dir, exist_ok=True)
+    filename = os.path.join(results_dir, "combined_magic_distribution.png")
     plt.savefig(filename, bbox_inches='tight', pad_inches=0.1)
     print("Combined image saved as:", filename)
 
