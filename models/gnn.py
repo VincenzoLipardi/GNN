@@ -17,14 +17,19 @@ except Exception:
     from torch.cuda.amp import autocast, GradScaler  # type: ignore
     _AMP_DEVICE_TYPE = 'cuda'
 
-# Ensure project root on sys.path when executed directly
+# Ensure project root on sys.path when executed directly, with robust fallbacks
 try:
-    from .graph_representation import QuantumCircuitGraphDataset
+    from .graph_representation import QuantumCircuitGraphDataset, get_node_feature_dim, get_global_feature_dim
 except Exception:
     project_root = Path(__file__).resolve().parents[1]
-    if str(project_root) not in sys.path:
-        sys.path.append(str(project_root))
-    from models.graph_representation import QuantumCircuitGraphDataset
+    models_dir = Path(__file__).resolve().parent
+    for p in (project_root, models_dir):
+        if str(p) not in sys.path:
+            sys.path.append(str(p))
+    try:
+        from models.graph_representation import QuantumCircuitGraphDataset, get_node_feature_dim, get_global_feature_dim
+    except Exception:
+        from graph_representation import QuantumCircuitGraphDataset, get_node_feature_dim, get_global_feature_dim
 
 
 
@@ -47,6 +52,7 @@ GNN_HIDDEN = 32
 GNN_HEADS = 2
 GLOBAL_HIDDEN = 64
 REG_HIDDEN = 128
+NUM_LAYERS = 3
 
 
 class GlobalMLP(nn.Module):
@@ -81,7 +87,7 @@ class RegressorHead(nn.Module):
 
 
 class CircuitGNN(nn.Module):
-    """GNN with TransformerConv layers, global branch, and regressor."""
+    """GNN with configurable number of TransformerConv layers, global branch, and regressor."""
 
     def __init__(
         self,
@@ -91,6 +97,7 @@ class CircuitGNN(nn.Module):
         global_in_dim: int = 8,
         global_hidden: int = GLOBAL_HIDDEN,
         reg_hidden: int = REG_HIDDEN,
+        num_layers: int = NUM_LAYERS,
     ):
         super().__init__()
 
@@ -98,11 +105,19 @@ class CircuitGNN(nn.Module):
 
         self.global_mean_pool = global_mean_pool
 
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        self.num_layers = int(num_layers)
         self.gnn_hidden = gnn_hidden
         self.gnn_heads = gnn_heads
-        self.conv1 = TransformerConv(node_in_dim, gnn_hidden, heads=gnn_heads, dropout=0.0, beta=False)
-        self.conv2 = TransformerConv(gnn_hidden * gnn_heads, gnn_hidden, heads=gnn_heads, dropout=0.0, beta=False)
-        self.conv3 = TransformerConv(gnn_hidden * gnn_heads, gnn_hidden, heads=gnn_heads, dropout=0.0, beta=False)
+
+        convs = []
+        # First layer takes node_in_dim
+        convs.append(TransformerConv(node_in_dim, gnn_hidden, heads=gnn_heads, dropout=0.0, beta=False))
+        # Remaining layers take gnn_hidden * gnn_heads as input
+        for _ in range(1, self.num_layers):
+            convs.append(TransformerConv(gnn_hidden * gnn_heads, gnn_hidden, heads=gnn_heads, dropout=0.0, beta=False))
+        self.conv_layers = nn.ModuleList(convs)
 
         self.global_mlp = GlobalMLP(global_in_dim, global_hidden)
         concat_dim = gnn_hidden * gnn_heads + global_hidden
@@ -117,13 +132,13 @@ class CircuitGNN(nn.Module):
             num_graphs = getattr(data, 'num_graphs', 1)
             x_pool = torch.zeros((num_graphs, self.gnn_hidden * self.gnn_heads), device=x.device, dtype=x.dtype)
         else:
-            x = self.conv1(x, edge_index)
-            x = F.relu(x)
-            x = self.conv2(x, edge_index)
-            x = F.relu(x)
-            x = self.conv3(x, edge_index)
-            x = F.relu(x)
-            x_pool = self.global_mean_pool(x, batch)
+            # Force full precision for message passing to avoid AMP-induced NaNs
+            with autocast(_AMP_DEVICE_TYPE, enabled=False):
+                x = x.float()
+                for conv in self.conv_layers:
+                    x = conv(x, edge_index)
+                    x = F.relu(x)
+                x_pool = self.global_mean_pool(x, batch)
 
         # Reshape concatenated global features back to [num_graphs, feat_dim]
         g_raw = data.global_features
@@ -147,45 +162,19 @@ class CircuitGNN(nn.Module):
 
 
 # =========================================
+# Loss helper
+# =========================================
+def _make_criterion(loss_type: str) -> nn.Module:
+    lt = (loss_type or 'huber').strip().lower()
+    if lt in ('mse', 'mse_loss', 'mean_squared_error'):
+        return nn.MSELoss()
+    # default: huber
+    return nn.HuberLoss()
+
+
+# =========================================
 # Loaders
 # =========================================
-def build_dataloader(
-    pkl_paths: List[str],
-    batch_size: int = 32,
-    val_split: float = 0.2,
-    test_split: float = 0.1,
-    seed: int = 42,
-    global_feature_variant: str = "baseline",
-    node_feature_backend_variant: Optional[str] = None,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    suffix = f"{global_feature_variant}_backend_{node_feature_backend_variant or 'none'}"
-    root = _cache_root_for_paths(pkl_paths, suffix=suffix)
-    dataset = QuantumCircuitGraphDataset(
-        root=root,
-        pkl_paths=pkl_paths,
-        global_feature_variant=global_feature_variant,
-        node_feature_backend_variant=node_feature_backend_variant,
-    )
-
-    if len(dataset) == 0:
-        raise RuntimeError("Dataset is empty. Check PKL paths and formats.")
-
-    test_len = max(1, int(len(dataset) * test_split))
-    val_len = max(1, int(len(dataset) * val_split))
-    train_len = max(1, len(dataset) - val_len - test_len)
-    while train_len + val_len + test_len > len(dataset):
-        train_len -= 1
-    generator = torch.Generator().manual_seed(seed)
-    train_ds, val_ds, test_ds = random_split(dataset, [train_len, val_len, test_len], generator=generator)
-
-    # Efficient loader defaults
-    num_cpus = os.cpu_count() or 0
-    default_workers = 2 if num_cpus > 2 else 0
-    pin_mem = torch.cuda.is_available()
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=default_workers, pin_memory=pin_mem)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=default_workers, pin_memory=pin_mem)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=default_workers, pin_memory=pin_mem)
-    return train_loader, val_loader, test_loader
 
 
 def build_train_test_loaders(
@@ -287,126 +276,6 @@ def build_train_val_test_loaders_two_stage(
 # =========================================
 # Training
 # =========================================
-def train(
-    pkl_paths: List[str],
-    epochs: int = 200,
-    lr: float = 1e-3,
-    batch_size: int = 32,
-    device: Optional[str] = None,
-    global_feature_variant: str = "baseline",
-    node_feature_backend_variant: Optional[str] = None,
-    early_stopping_patience: int = 20,
-    early_stopping_min_delta: float = 0.0,
-    model_kwargs: Optional[Dict[str, Any]] = None,
-):
-    train_loader, val_loader, test_loader = build_dataloader(
-        pkl_paths,
-        batch_size=batch_size,
-        val_split=0.2,
-        test_split=0.1,
-        global_feature_variant=global_feature_variant,
-        node_feature_backend_variant=node_feature_backend_variant,
-    )
-
-    gdim = 152 if global_feature_variant == "binned152" else 8
-    model_args = dict(global_in_dim=gdim)
-    # Determine node feature dimension
-    node_in_dim = 13 + (7 if node_feature_backend_variant else 0)
-    model_args.update(dict(node_in_dim=node_in_dim))
-    if model_kwargs:
-        model_args.update(model_kwargs)
-        model_args.setdefault('global_in_dim', gdim)
-        model_args.setdefault('node_in_dim', node_in_dim)
-    model = CircuitGNN(**model_args)
-    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    if dev.type == 'cuda':
-        torch.backends.cudnn.benchmark = True
-    model.to(dev)
-
-    criterion = nn.HuberLoss()
-    optimizer = Adam(model.parameters(), lr=lr)
-
-    best_val = float('inf')
-    best_state = None
-    epochs_without_improve = 0
-
-    # Initialize AMP scaler (fallback to CUDA AMP if torch.amp not available)
-    try:
-        scaler = GradScaler(device=_AMP_DEVICE_TYPE, enabled=(dev.type == 'cuda'))
-    except TypeError:
-        scaler = GradScaler(enabled=(dev.type == 'cuda'))
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = 0.0
-        for batch in train_loader:
-            batch = batch.to(dev, non_blocking=True)
-            if getattr(batch, 'y', None) is None:
-                raise RuntimeError("Labels 'y' are missing in dataset. Ensure PKLs are labeled.")
-            optimizer.zero_grad(set_to_none=True)
-            with autocast(_AMP_DEVICE_TYPE, enabled=(dev.type == 'cuda')):
-                pred = model(batch)
-                target = batch.y.view(-1)
-                mask = torch.isfinite(target)
-                if mask.sum() == 0:
-                    continue
-                loss = criterion(pred[mask], target[mask])
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            total_loss += loss.detach().item() * int(mask.sum().item())
-
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = batch.to(dev, non_blocking=True)
-                with autocast(_AMP_DEVICE_TYPE, enabled=(dev.type == 'cuda')):
-                    pred = model(batch)
-                    target = batch.y.view(-1)
-                    mask = torch.isfinite(target)
-                    if mask.sum() == 0:
-                        continue
-                    loss = criterion(pred[mask], target[mask])
-                val_loss += loss.detach().item() * int(mask.sum().item())
-
-        train_loss_epoch = total_loss/max(1, len(train_loader.dataset))
-        val_loss_epoch = val_loss/max(1, len(val_loader.dataset))
-        print(f"Epoch {epoch:03d} | TrainLoss {train_loss_epoch:.4f} | ValLoss {val_loss_epoch:.4f}")
-
-        if val_loss_epoch + early_stopping_min_delta < best_val:
-            best_val = val_loss_epoch
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            epochs_without_improve = 0
-        else:
-            epochs_without_improve += 1
-            if epochs_without_improve >= early_stopping_patience:
-                print(f"Early stopping triggered at epoch {epoch:03d} (best ValLoss {best_val:.4f}).")
-                break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    model.eval()
-    criterion = nn.HuberLoss()
-    test_loss = 0.0
-    mae = 0.0
-    n = 0
-    with torch.no_grad():
-        for batch in test_loader:
-            batch = batch.to(dev, non_blocking=True)
-            with autocast(_AMP_DEVICE_TYPE, enabled=(dev.type == 'cuda')):
-                pred = model(batch)
-                target = batch.y.view(-1)
-                mask = torch.isfinite(target)
-                if mask.sum() == 0:
-                    continue
-                loss = criterion(pred[mask], target[mask])
-            test_loss += loss.detach().item() * int(mask.sum().item())
-            mae += torch.mean(torch.abs(pred[mask] - target[mask])).item() * int(mask.sum().item())
-            n += int(mask.sum().item())
-    print(f"TestLoss {test_loss/max(1,n):.4f} | TestMAE {mae/max(1,n):.4f}")
-
-    return model
 
 
 @torch.no_grad()
@@ -429,6 +298,33 @@ def evaluate_overall_mse(model: nn.Module, loader: DataLoader, device: torch.dev
     return total_se / max(1, total_n)
 
 
+@torch.no_grad()
+def evaluate_overall_r2(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    use_amp = (device.type == 'cuda')
+    y_all: List[float] = []
+    yhat_all: List[float] = []
+    for batch in loader:
+        batch = batch.to(device, non_blocking=True)
+        with autocast(_AMP_DEVICE_TYPE, enabled=use_amp):
+            pred = model(batch)
+            y = batch.y.view(-1)
+            mask = torch.isfinite(y)
+            if mask.sum() == 0:
+                continue
+            y_all.extend(y[mask].detach().cpu().tolist())
+            yhat_all.extend(pred[mask].detach().cpu().tolist())
+    if not y_all:
+        return 0.0
+    import math
+    y_mean = sum(y_all) / len(y_all)
+    ss_res = sum((yh - y) ** 2 for yh, y in zip(yhat_all, y_all))
+    ss_tot = sum((y - y_mean) ** 2 for y in y_all)
+    if ss_tot == 0 or math.isclose(ss_tot, 0.0):
+        return 0.0
+    return 1.0 - (ss_res / ss_tot)
+
+
 def grid_search(
     pkl_paths: List[str],
     configs: List[Dict[str, int]],
@@ -449,17 +345,19 @@ def grid_search(
         node_feature_backend_variant=node_feature_backend_variant,
     )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    criterion = nn.HuberLoss()
     results = []
 
     for cfg in configs:
+        loss_type = str(cfg.get('loss_type', 'huber'))
+        criterion = _make_criterion(loss_type)
         model = CircuitGNN(
-            node_in_dim=13 + (7 if node_feature_backend_variant else 0),
+            node_in_dim=get_node_feature_dim(node_feature_backend_variant),
             gnn_hidden=cfg.get('gnn_hidden', GNN_HIDDEN),
             gnn_heads=cfg.get('gnn_heads', GNN_HEADS),
-            global_in_dim=(152 if global_feature_variant == "binned152" else 8),
+            global_in_dim=get_global_feature_dim(global_feature_variant),
             global_hidden=cfg.get('global_hidden', GLOBAL_HIDDEN),
             reg_hidden=cfg.get('reg_hidden', REG_HIDDEN),
+            num_layers=int(cfg.get('num_layers', NUM_LAYERS)),
         ).to(dev)
         optimizer = Adam(model.parameters(), lr=lr)
 
@@ -473,12 +371,18 @@ def grid_search(
                 if mask.sum() == 0:
                     continue
                 loss = criterion(pred[mask], target[mask])
+                if not torch.isfinite(loss):
+                    continue
                 optimizer.zero_grad()
                 loss.backward()
+                try:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                except Exception:
+                    pass
                 optimizer.step()
 
         val_mse = evaluate_overall_mse(model, val_loader, dev)
-        res = {**cfg, 'val_mse': float(val_mse)}
+        res = {**cfg, 'val_mse': float(val_mse), 'loss_type': loss_type}
         results.append(res)
 
     results.sort(key=lambda r: r['val_mse'])
@@ -499,6 +403,7 @@ def train_with_two_stage_split(
     val_within_train: float = 0.1,
     model_kwargs: Optional[Dict[str, Any]] = None,
     seed: int = 42,
+    loss_type: str = "huber",
 ):
     train_loader, val_loader, test_loader = build_train_val_test_loaders_two_stage(
         pkl_paths,
@@ -510,9 +415,9 @@ def train_with_two_stage_split(
         node_feature_backend_variant=node_feature_backend_variant,
     )
 
-    gdim = 152 if global_feature_variant == "binned152" else 8
+    gdim = get_global_feature_dim(global_feature_variant)
     model_args = dict(global_in_dim=gdim)
-    node_in_dim = 13 + (7 if node_feature_backend_variant else 0)
+    node_in_dim = get_node_feature_dim(node_feature_backend_variant)
     model_args.update(dict(node_in_dim=node_in_dim))
     if model_kwargs:
         model_args.update(model_kwargs)
@@ -524,7 +429,7 @@ def train_with_two_stage_split(
         torch.backends.cudnn.benchmark = True
     model.to(dev)
 
-    criterion = nn.HuberLoss()
+    criterion = _make_criterion(loss_type)
     optimizer = Adam(model.parameters(), lr=lr)
 
     best_val = float('inf')
@@ -550,7 +455,14 @@ def train_with_two_stage_split(
                 if mask.sum() == 0:
                     continue
                 loss = criterion(pred[mask], target[mask])
+            if not torch.isfinite(loss):
+                continue
             scaler.scale(loss).backward()
+            try:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            except Exception:
+                pass
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss.detach().item() * batch.num_graphs
