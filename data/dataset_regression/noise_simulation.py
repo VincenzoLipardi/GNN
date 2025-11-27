@@ -11,7 +11,10 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.append(CURRENT_DIR)
 
-from noise_study import estimate_stabilizer_renyi_entropy_on_backend  # noqa: E402
+from noise_study import (
+    estimate_stabilizer_renyi_entropy_on_backend,  # noqa: E402
+    estimate_stabilizer_renyi_entropy_on_backend_native,  # noqa: E402
+)  
 
 from qiskit import QuantumCircuit  # noqa: E402
 from qiskit_ibm_runtime.fake_provider import FakeOslo  # noqa: E402
@@ -67,6 +70,45 @@ def _to_quantum_circuit(qasm_str: str) -> QuantumCircuit:
     return QuantumCircuit.from_qasm_str(qasm_str)
 
 
+def _qasm_from_circuit(circ: QuantumCircuit) -> Optional[str]:
+    # Prefer QuantumCircuit.qasm() when available; fallback to qasm2.dumps
+    try:
+        qasm_method = getattr(circ, "qasm", None)
+        if callable(qasm_method):
+            return qasm_method()
+    except Exception:
+        pass
+    try:
+        from qiskit.qasm2 import dumps as qasm2_dumps
+        return qasm2_dumps(circ)
+    except Exception:
+        return None
+
+
+def _transpile_to_oslo_qasm(qasm_str: str, optimization_level: int = 3) -> Optional[str]:
+    try:
+        from qiskit import QuantumCircuit as _QuantumCircuit
+        from qiskit import transpile as _transpile
+        try:
+            from qiskit_ibm_runtime.fake_provider import FakeOslo as _FakeOslo
+        except Exception:
+            from qiskit.providers.fake_provider import FakeOslo as _FakeOslo
+    except Exception:
+        return None
+
+    try:
+        circ = _QuantumCircuit.from_qasm_str(qasm_str)
+    except Exception:
+        return None
+
+    try:
+        backend = _FakeOslo()
+        native = _transpile(circ, backend=backend, optimization_level=optimization_level)
+    except Exception:
+        native = circ
+    return _qasm_from_circuit(native)
+
+
 def process_dataset_tim_noisy(
     input_dir: str,
     output_dir: str,
@@ -120,7 +162,7 @@ def process_dataset_tim_noisy(
                 circuit_info, qasm = _extract_qasm_and_info(item)
                 qc = _to_quantum_circuit(qasm)
                 sre_noisy = estimate_stabilizer_renyi_entropy_on_backend(
-                    qc, backend=backend, alpha=alpha, shots=shots
+                    qc, backend=backend, alpha=alpha
                 )
             except Exception as exc:
                 print(f"  [warn] Failed on one circuit in {rel_name}: {exc}; recording NaN")
@@ -235,7 +277,7 @@ def process_dataset_random_noisy(
                 circuit_info, qasm = _extract_qasm_and_info(item)
                 qc = _to_quantum_circuit(qasm)
                 sre_noisy = estimate_stabilizer_renyi_entropy_on_backend(
-                    qc, backend=backend, alpha=alpha, shots=shots
+                    qc, backend=backend, alpha=alpha
                 )
             except Exception as exc:
                 print(f"  [warn] Failed on one circuit in {rel_name}: {exc}; recording NaN")
@@ -254,13 +296,188 @@ def process_dataset_random_noisy(
         print(f"[done] Wrote noisy dataset to: {out_path}")
 
 
+def process_dataset_tim_oslo(
+    input_dir: str,
+    output_dir: str,
+    max_qubits: int = 5,
+    max_trotter: int = 3,
+    alpha: int = 2,
+    exact_qubits: Optional[int] = None,
+) -> None:
+    """Create a native-transpiled noisy-labeled copy of dataset_tim using FakeOslo.
+
+    For each circuit entry, converts QASM to QuantumCircuit and computes SRE
+    via noise_study.estimate_stabilizer_renyi_entropy_on_backend_native.
+    Writes tuples (circuit_dict, sre_oslo) to mirrored filenames under output_dir.
+    """
+    backend = FakeOslo()
+
+    target_files = _iter_tim_files(input_dir, max_qubits=max_qubits, max_trotter=max_trotter, exact_qubits=exact_qubits)
+    if not target_files:
+        if exact_qubits is not None:
+            print(f"No matching files found in {input_dir} for qubits== {exact_qubits} and trotter<= {max_trotter}")
+        else:
+            print(f"No matching files found in {input_dir} for qubits<= {max_qubits} and trotter<= {max_trotter}")
+        return
+
+    for in_path in target_files:
+        rel_name = os.path.basename(in_path)
+        out_path = os.path.join(output_dir, rel_name)
+
+        if os.path.exists(out_path):
+            print(f"[skip] Output already exists: {out_path}")
+            continue
+
+        try:
+            data = _load_pickle(in_path)
+        except Exception as exc:
+            print(f"[warn] Failed to load {in_path}: {exc}")
+            continue
+
+        if not data:
+            print(f"[warn] Empty dataset in {in_path}; writing empty output")
+            _save_pickle(out_path, [])
+            continue
+
+        results: List[Tuple[Dict[str, Any], float]] = []
+        print(f"Processing {rel_name} with {len(data)} circuits (native FakeOslo) ...")
+        for item in tqdm(data, desc=f"{rel_name}", unit="circ"):
+            try:
+                circuit_info, qasm = _extract_qasm_and_info(item)
+                qc = _to_quantum_circuit(qasm)
+                # Transpile ONCE to FakeOslo backend; reuse for both saving QASM and SRE
+                try:
+                    from qiskit import transpile as _transpile
+                    qc_native = _transpile(qc, backend=backend, optimization_level=3)
+                except Exception:
+                    qc_native = qc
+                # Compute SRE using the noisy backend on the already-native circuit
+                sre_oslo = estimate_stabilizer_renyi_entropy_on_backend(
+                    qc_native, backend=backend, alpha=alpha
+                )
+            except Exception as exc:
+                print(f"  [warn] Failed on one circuit in {rel_name}: {exc}; recording NaN")
+                sre_oslo = float("nan")
+            # Save the circuit AFTER transpilation to FakeOslo (as in fix_oslo_qasm.py)
+            qasm_transpiled = _qasm_from_circuit(qc_native)
+            if isinstance(qasm_transpiled, str) and qasm_transpiled:
+                updated_info = dict(circuit_info)
+                updated_info["qasm"] = qasm_transpiled
+                results.append((updated_info, float(sre_oslo)))
+            else:
+                results.append((circuit_info, float(sre_oslo)))
+
+        _save_pickle(out_path, results)
+        print(f"[done] Wrote oslo dataset to: {out_path}")
+
+
+def process_dataset_random_oslo(
+    input_dir: str,
+    output_dir: str,
+    max_qubits: int = 5,
+    max_gates_end: int = 19,
+    alpha: int = 2,
+    exact_qubits: Optional[int] = None,
+    min_qubits: int = 2,
+    min_gates_start: int = 0,
+) -> None:
+    """Create a native-transpiled noisy-labeled copy of dataset_random using FakeOslo.
+
+    For each circuit entry, converts QASM to QuantumCircuit and computes SRE
+    via noise_study.estimate_stabilizer_renyi_entropy_on_backend_native.
+    Writes tuples (circuit_dict, sre_oslo) to mirrored filenames under output_dir.
+    """
+    backend = FakeOslo()
+
+    target_files = _iter_random_files(
+        input_dir,
+        max_qubits=max_qubits,
+        max_gates_end=max_gates_end,
+        exact_qubits=exact_qubits,
+        min_qubits=min_qubits,
+        min_gates_start=min_gates_start,
+    )
+    if not target_files:
+        if exact_qubits is not None:
+            print(
+                f"No matching files found in {input_dir} for qubits== {exact_qubits} and gates {min_gates_start}-{max_gates_end}"
+            )
+        else:
+            print(
+                f"No matching files found in {input_dir} for qubits {min_qubits}-{max_qubits} and gates {min_gates_start}-{max_gates_end}"
+            )
+        return
+
+    for in_path in target_files:
+        rel_name = os.path.basename(in_path)
+        out_path = os.path.join(output_dir, rel_name)
+
+        if os.path.exists(out_path):
+            print(f"[skip] Output already exists: {out_path}")
+            continue
+
+        try:
+            data = _load_pickle(in_path)
+        except Exception as exc:
+            print(f"[warn] Failed to load {in_path}: {exc}")
+            continue
+
+        if not data:
+            print(f"[warn] Empty dataset in {in_path}; writing empty output")
+            _save_pickle(out_path, [])
+            continue
+
+        results: List[Tuple[Dict[str, Any], float]] = []
+        print(f"Processing {rel_name} with {len(data)} circuits (native FakeOslo) ...")
+        total = len(data)
+        checkpoint_interval = max(1, int(total * 0.05))
+        for idx, item in enumerate(tqdm(data, desc=f"{rel_name}", unit="circ")):
+            try:
+                circuit_info, qasm = _extract_qasm_and_info(item)
+                qc = _to_quantum_circuit(qasm)
+                # Transpile ONCE to FakeOslo backend; reuse for both saving QASM and SRE
+                try:
+                    from qiskit import transpile as _transpile
+                    qc_native = _transpile(qc, backend=backend, optimization_level=3)
+                except Exception:
+                    qc_native = qc
+                # Compute SRE using the noisy backend on the already-native circuit
+                sre_oslo = estimate_stabilizer_renyi_entropy_on_backend(
+                    qc_native, backend=backend, alpha=alpha
+                )
+            except Exception as exc:
+                print(f"  [warn] Failed on one circuit in {rel_name}: {exc}; recording NaN")
+                sre_oslo = float("nan")
+            # Save the circuit AFTER transpilation to FakeOslo (as in fix_oslo_qasm.py)
+            qasm_transpiled = _qasm_from_circuit(qc_native)
+            if isinstance(qasm_transpiled, str) and qasm_transpiled:
+                updated_info = dict(circuit_info)
+                updated_info["qasm"] = qasm_transpiled
+                results.append((updated_info, float(sre_oslo)))
+            else:
+                results.append((circuit_info, float(sre_oslo)))
+            if (idx + 1) % checkpoint_interval == 0:
+                tmp_path = out_path + ".partial"
+                try:
+                    _save_pickle(tmp_path, results)
+                    print(f"  [checkpoint] Saved {idx + 1}/{total} to {tmp_path}")
+                except Exception as exc:
+                    print(f"  [warn] Failed to write checkpoint {tmp_path}: {exc}")
+
+        _save_pickle(out_path, results)
+        print(f"[done] Wrote oslo dataset to: {out_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create noisy-labeled datasets (TIM and/or Random)")
     parser.add_argument(
         "--which",
-        choices=["random", "tim", "both"],
+        choices=["random", "tim", "both", "random_oslo", "tim_oslo", "both_oslo"],
         default="random",
-        help="Select which dataset(s) to process. Default: random",
+        help=(
+            "Select which dataset(s) to process. Options: random, tim, both, "
+            "random_oslo, tim_oslo, both_oslo. Default: random"
+        ),
     )
     args = parser.parse_args()
 
@@ -290,10 +507,37 @@ def main() -> None:
             max_qubits=6,
             max_gates_end=39,
             alpha=2,
-            shots=10000,
             exact_qubits=None,
             min_qubits=2,
             min_gates_start=20,
+        )
+
+    if args.which in ("tim_oslo", "both_oslo"):
+        input_dir_tim = os.path.join(base_dir, "dataset_tim")
+        output_dir_tim_oslo = os.path.join(base_dir, "dataset_tim_oslo")
+        os.makedirs(output_dir_tim_oslo, exist_ok=True)
+        process_dataset_tim_oslo(
+            input_dir=input_dir_tim,
+            output_dir=output_dir_tim_oslo,
+            max_qubits=6,
+            max_trotter=5,
+            alpha=2,
+            exact_qubits=None,
+        )
+
+    if args.which in ("random_oslo", "both_oslo"):
+        random_input_dir = os.path.join(base_dir, "dataset_random")
+        random_output_dir_oslo = os.path.join(base_dir, "dataset_random_oslo")
+        os.makedirs(random_output_dir_oslo, exist_ok=True)
+        process_dataset_random_oslo(
+            input_dir=random_input_dir,
+            output_dir=random_output_dir_oslo,
+            max_qubits=6,
+            max_gates_end=99,
+            alpha=2,
+            exact_qubits=None,
+            min_qubits=6,
+            min_gates_start=0,
         )
 
 

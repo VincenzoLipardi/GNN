@@ -5,6 +5,14 @@ from typing import List, Optional, Tuple, Dict, Any
 
 import torch
 
+import sys
+# Ensure project root on sys.path for model imports
+script_dir = Path(__file__).resolve().parent
+project_root = script_dir.parent if script_dir.name == "models" else script_dir
+if str(project_root) not in sys.path:
+    # Prepend so it takes precedence over the script directory (avoids models.py shadowing the package)
+    sys.path.insert(0, str(project_root))
+
 from models.neural_network import (
     train_with_two_stage_split_mlp,
     evaluate_overall_mse_mlp,
@@ -24,8 +32,8 @@ CONFIG: Dict[str, Any] = {
     "experiment": "depth",
 
     # Data dirs
-    "random_base_dir": "/data/P70087789/GNN/data/dataset_random",
-    "tim_base_dir": "/data/P70087789/GNN/data/dataset_tim",
+    "random_base_dir": "/data/P70087789/GNN/data/dataset_regression/dataset_random",
+    "tim_base_dir": "/data/P70087789/GNN/data/dataset_regression/dataset_tim",
     "results_dir": "/data/P70087789/GNN/models/results",
 
     # Features/architecture/training

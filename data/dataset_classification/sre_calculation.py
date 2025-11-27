@@ -25,7 +25,7 @@ def _extract_qasm_and_info(item: Any) -> Tuple[Dict[str, Any], str]:
         info = item
     if not isinstance(info, dict) or "qasm" not in info:
         raise ValueError("Unexpected dataset entry format; expected dict with 'qasm' or (dict, label)")
-    return info, str(info["qasm"])  # type: ignore[index]
+    return info, str(info["qasm"])
 
 
 def _circuit_from_qasm(qasm_str: str) -> QuantumCircuit:
@@ -34,7 +34,7 @@ def _circuit_from_qasm(qasm_str: str) -> QuantumCircuit:
     Falls back to QuantumCircuit.from_qasm_str if qasm2 is unavailable.
     """
     if qasm2_loads is not None:
-        return qasm2_loads(qasm_str)  # type: ignore[misc]
+        return qasm2_loads(qasm_str)
     return QuantumCircuit.from_qasm_str(qasm_str)
 
 
@@ -59,7 +59,7 @@ def _make_unitary_only_circuit(circuit: QuantumCircuit) -> QuantumCircuit:
     cleaned = QuantumCircuit(circuit.num_qubits, name=circuit.name)
     # Best-effort: try to drop final measurements via provided helper if present
     try:
-        circuit = circuit.remove_final_measurements(inplace=False)  # type: ignore[attr-defined]
+        circuit = circuit.remove_final_measurements(inplace=False)
     except Exception:
         pass
     for instr, qargs, cargs in circuit.data:
@@ -216,7 +216,7 @@ def main(
 ) -> None:
     if files is None:
         files = [
-            "/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_2_10.pkl",
+            "/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_11_25.pkl",
 ]
 
     for f in files:

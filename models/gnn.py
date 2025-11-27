@@ -49,22 +49,26 @@ def _cache_root_for_paths(paths: List[str], suffix: str = "") -> str:
 # Architecture (GNN model)
 # =========================================
 GNN_HIDDEN = 32
-GNN_HEADS = 2
-GLOBAL_HIDDEN = 64
-REG_HIDDEN = 128
-NUM_LAYERS = 3
+GNN_HEADS = 8
+GLOBAL_HIDDEN = 16
+REG_HIDDEN = 16
+NUM_LAYERS = 5
 
 
 class GlobalMLP(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = 64):
+    def __init__(self, in_dim: int, hidden_dim: int = 64, dropout_rate: float = 0.0):
         super().__init__()
+        dr = float(dropout_rate) if dropout_rate is not None else 0.0
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(p=dr),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(p=dr),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(p=dr),
         )
 
     def forward(self, g: Tensor) -> Tensor:
@@ -72,13 +76,16 @@ class GlobalMLP(nn.Module):
 
 
 class RegressorHead(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = 128):
+    def __init__(self, in_dim: int, hidden_dim: int = 128, dropout_rate: float = 0.0):
         super().__init__()
+        dr = float(dropout_rate) if dropout_rate is not None else 0.0
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(p=dr),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(p=dr),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -98,6 +105,7 @@ class CircuitGNN(nn.Module):
         global_hidden: int = GLOBAL_HIDDEN,
         reg_hidden: int = REG_HIDDEN,
         num_layers: int = NUM_LAYERS,
+        dropout_rate: float = 0.1,
     ):
         super().__init__()
 
@@ -110,18 +118,19 @@ class CircuitGNN(nn.Module):
         self.num_layers = int(num_layers)
         self.gnn_hidden = gnn_hidden
         self.gnn_heads = gnn_heads
+        self.dropout_rate = float(dropout_rate) if dropout_rate is not None else 0.0
 
         convs = []
         # First layer takes node_in_dim
-        convs.append(TransformerConv(node_in_dim, gnn_hidden, heads=gnn_heads, dropout=0.0, beta=False))
+        convs.append(TransformerConv(node_in_dim, gnn_hidden, heads=gnn_heads, dropout=self.dropout_rate, beta=False))
         # Remaining layers take gnn_hidden * gnn_heads as input
         for _ in range(1, self.num_layers):
-            convs.append(TransformerConv(gnn_hidden * gnn_heads, gnn_hidden, heads=gnn_heads, dropout=0.0, beta=False))
+            convs.append(TransformerConv(gnn_hidden * gnn_heads, gnn_hidden, heads=gnn_heads, dropout=self.dropout_rate, beta=False))
         self.conv_layers = nn.ModuleList(convs)
 
-        self.global_mlp = GlobalMLP(global_in_dim, global_hidden)
+        self.global_mlp = GlobalMLP(global_in_dim, global_hidden, dropout_rate=self.dropout_rate)
         concat_dim = gnn_hidden * gnn_heads + global_hidden
-        self.regressor = RegressorHead(concat_dim, reg_hidden)
+        self.regressor = RegressorHead(concat_dim, reg_hidden, dropout_rate=self.dropout_rate)
 
     def forward(self, data) -> Tensor:
         x, edge_index, batch = data.x, data.edge_index, getattr(data, 'batch', None)
@@ -138,6 +147,8 @@ class CircuitGNN(nn.Module):
                 for conv in self.conv_layers:
                     x = conv(x, edge_index)
                     x = F.relu(x)
+                    if self.dropout_rate > 0.0:
+                        x = F.dropout(x, p=self.dropout_rate, training=self.training)
                 x_pool = self.global_mean_pool(x, batch)
 
         # Reshape concatenated global features back to [num_graphs, feat_dim]
@@ -213,7 +224,7 @@ def build_train_test_loaders(
 def build_full_loader(
     pkl_paths: List[str],
     batch_size: int = 64,
-    global_feature_variant: str = "baseline",
+    global_feature_variant: str = "binned152",
     node_feature_backend_variant: Optional[str] = None,
 ):
     suffix = f"{global_feature_variant}_backend_{node_feature_backend_variant or 'none'}"

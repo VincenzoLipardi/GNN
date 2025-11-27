@@ -7,11 +7,10 @@ from matplotlib.ticker import MaxNLocator, MultipleLocator, AutoMinorLocator, Fi
 # === CONFIGURATION ===
 plt.style.use("seaborn-v0_8-whitegrid")
 
-JSON_PATH_ENTANGLED = "/data/P70087789/GNN/data/dataset_classification/results/training_product_states_2_10.json"
-
-JSON_PATH_PRODUCT = "/data/P70087789/GNN/data/dataset_classification/results/training_product_states_18.json"
-JSON_PATH_EVAL_ENTANGLED = "/data/P70087789/GNN/data/dataset_classification/results/evaluation_product_states_2_10_clifford_evolved_2_10.json"
-JSON_PATH_EVAL_PRODUCT = "/data/P70087789/GNN/data/dataset_classification/results/evaluation_product_states_18_clifford_evolved_18.json"
+JSON_PATH_ENTANGLED = "/data/P70087789/GNN/data/dataset_classification/results/training_product_states_2_25_balanced_by_sre.json"
+JSON_PATH_PRODUCT = "/data/P70087789/GNN/data/dataset_classification/results/training_product_states_2_10_balanced_by_sre.json"
+JSON_PATH_EVAL_ENTANGLED = "/data/P70087789/GNN/data/dataset_classification/results/evaluation_product_states_2_25_balanced_by_sre_clifford_evolved_2_25_balanced_by_sre.json"
+JSON_PATH_EVAL_PRODUCT = "/data/P70087789/GNN/data/dataset_classification/results/evaluation_product_states_2_10_balanced_by_sre_clifford_evolved_2_10_balanced_by_sre.json"
 
 
 IMAGES_DIR = os.path.join(os.path.dirname(__file__), "images")
@@ -190,29 +189,28 @@ def load_training_depth0_per_class(json_path):
     return float(magic_acc0), float(stabilizer_acc0)
 
 
-def set_adaptive_ylim(ax, values):
-    """Adaptive y-axis that includes 100% and provides clear separation."""
-    valid = np.array(values[np.isfinite(values)]) * 100
-    if len(valid) == 0:
-        ax.set_ylim(99.5, 100.2)
+def set_adaptive_ylim(ax, values_pct):
+    """Adaptive y-axis based on data in percent, with small margins."""
+    valid = np.array(values_pct[np.isfinite(values_pct)])
+    if valid.size == 0:
+        ax.set_ylim(0.0, 100.0)
         return
-    ymin, ymax = np.min(valid), np.max(valid)
+    ymin, ymax = float(np.min(valid)), float(np.max(valid))
     # Keep very tight margins around the data with small headroom
-    top_headroom = 0.10  # percentage points
-    bottom_margin = 0.05  # percentage points
-    min_span = 0.3  # ensure at least this total span
+    top_headroom = 1.0  # percentage points
+    bottom_margin = 1.0  # percentage points
+    min_span = 0.8  # ensure at least this total span
 
     upper = min(100.2, ymax + top_headroom)
-    # Always include 100% within the range
-    if upper < 100.0:
-        upper = 100.0
     lower = max(0.0, ymin - bottom_margin)
     if (upper - lower) < min_span:
-        lower = max(0.0, upper - min_span)
+        mid = 0.5 * (upper + lower)
+        lower = max(0.0, mid - 0.5 * min_span)
+        upper = min(100.2, mid + 0.5 * min_span)
     ax.set_ylim(lower, upper)
 
 
-def set_dense_yticks(ax):
+def set_dense_yticks(ax, max_major_ticks=None):
     """Set clean major/minor y-ticks (nice steps, include 100 if in view). Returns chosen major step."""
     lower, upper = ax.get_ylim()
     span = max(upper - lower, 1e-6)
@@ -224,8 +222,10 @@ def set_dense_yticks(ax):
         step = 0.2
     elif span <= 3.0:
         step = 0.5
+    elif span <= 10.0:
+        step = 1
     else:
-        step = 1.0
+        step = 2.0
 
     start = max(0.0, np.floor(lower / step) * step)
     ticks = np.arange(start, upper + 1e-9, step)
@@ -233,6 +233,18 @@ def set_dense_yticks(ax):
     # Ensure a tick at 100 if it lies within the limits
     if lower <= 100.0 <= upper:
         ticks = np.unique(np.append(ticks, 100.0))
+
+    # If too many ticks, coarsen the step until within limit
+    if max_major_ticks is not None and len(ticks) > max_major_ticks:
+        # Increase step progressively
+        safety = 0
+        while len(ticks) > max_major_ticks and safety < 10:
+            step *= 2.0
+            start = max(0.0, np.floor(lower / step) * step)
+            ticks = np.arange(start, upper + 1e-9, step)
+            if lower <= 100.0 <= upper:
+                ticks = np.unique(np.append(ticks, 100.0))
+            safety += 1
 
     ax.yaxis.set_major_locator(FixedLocator(ticks))
 
@@ -302,18 +314,19 @@ def plot_performance(json_product_train, json_entangled_train, json_product_eval
     }
 
     # Top subplot: Magic states
-    ax_magic.plot(depths_eval, magic_prod_eval_pct, "o-", linewidth=2, label="Trained on PS 18", color=colors["prod"])
-    ax_magic.plot(depths_eval, magic_ent_eval_pct, "s--", linewidth=2, label="Trained on PS 2-10", color=colors["ent"])
+    ax_magic.plot(depths_eval, magic_prod_eval_pct, "o-", linewidth=2, label="Trained on PS 2-10", color=colors["prod"])
+    ax_magic.plot(depths_eval, magic_ent_eval_pct, "s--", linewidth=2, label="Trained on PS 2-25", color=colors["ent"])
 
     # Bottom subplot: Stabilizer states
-    ax_stab.plot(depths_eval, stab_prod_eval_pct, "o-", linewidth=2, label="Trained on PS 18", color=colors["prod"])
-    ax_stab.plot(depths_eval, stab_ent_eval_pct, "s--", linewidth=2, label="Trained on PS 2-10", color=colors["ent"])
+    ax_stab.plot(depths_eval, stab_prod_eval_pct, "o-", linewidth=2, label="Trained on PS 2-10", color=colors["prod"])
+    ax_stab.plot(depths_eval, stab_ent_eval_pct, "s--", linewidth=2, label="Trained on PS 2-25", color=colors["ent"])
 
     # Axis formatting
-    set_adaptive_ylim(ax_magic, np.concatenate([magic_prod_eval_aligned, magic_ent_eval_aligned]))
+    set_adaptive_ylim(ax_magic, np.concatenate([magic_prod_eval_pct, magic_ent_eval_pct]))
     ax_magic.set_ylabel("Accuracy (%)", fontsize=12)
     ax_magic.grid(True, alpha=0.3)
-    step_magic = set_dense_yticks(ax_magic)
+    # Use a coarser limit on the number of y ticks for the top subplot
+    step_magic = set_dense_yticks(ax_magic, max_major_ticks=10)
     if step_magic >= 1.0:
         ax_magic.yaxis.set_major_formatter(lambda x, _: f"{x:.0f}")
     elif step_magic >= 0.1:
@@ -321,7 +334,7 @@ def plot_performance(json_product_train, json_entangled_train, json_product_eval
     else:
         ax_magic.yaxis.set_major_formatter(lambda x, _: f"{x:.2f}")
 
-    set_adaptive_ylim(ax_stab, np.concatenate([stab_prod_eval_aligned, stab_ent_eval_aligned]))
+    set_adaptive_ylim(ax_stab, np.concatenate([stab_prod_eval_pct, stab_ent_eval_pct]))
     ax_stab.set_ylabel("Accuracy (%)", fontsize=12)
     ax_stab.grid(True, alpha=0.3)
     step_stab = set_dense_yticks(ax_stab)
@@ -332,13 +345,13 @@ def plot_performance(json_product_train, json_entangled_train, json_product_eval
     else:
         ax_stab.yaxis.set_major_formatter(lambda x, _: f"{x:.2f}")
 
-    ax_magic.set_title("Magic States", fontsize=14, fontweight="bold")
-    ax_stab.set_title("Stabilizer States", fontsize=14, fontweight="bold")
+    ax_magic.set_title(r"high-$M_2$ Circuits", fontsize=14, fontweight="bold")
+    ax_stab.set_title(r"low-$M_2$ Circuits", fontsize=14, fontweight="bold")
     ax_stab.set_xlabel("Clifford Depth", fontsize=12)
 
     # Shared legend and x-axis setup
     for ax in [ax_magic, ax_stab]:
-        ax.legend(loc="lower right", frameon=True)
+        ax.legend(loc="lower left", frameon=True)
     if len(depths_eval) > 0:
         max_d = int(max(depths_eval))
         odd_ticks = list(range(1, max_d + 1, 2))
@@ -353,7 +366,7 @@ def plot_performance(json_product_train, json_entangled_train, json_product_eval
     plt.subplots_adjust(top=0.95, bottom=0.08, hspace=0.15)
 
     # Save output
-    filename = "classification_depth_same_size.png"
+    filename = "classification_depth_sre_classification.png"
     filepath = os.path.join(output_dir, filename)
     plt.savefig(filepath, dpi=200, bbox_inches="tight")
     plt.close()

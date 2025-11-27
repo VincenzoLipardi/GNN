@@ -11,11 +11,11 @@ except Exception:
     qasm2_dumps = None
     qasm2_loads = None
 try:
-    from qiskit.circuit.library import CXGate  # type: ignore
-    from qiskit.circuit import CircuitInstruction  # type: ignore
+    from qiskit.circuit.library import CXGate
+    from qiskit.circuit import CircuitInstruction
 except Exception:
-    CXGate = None  # type: ignore
-    CircuitInstruction = None  # type: ignore
+    CXGate = None
+    CircuitInstruction = None
 
 
 # Generation controls
@@ -227,7 +227,7 @@ def circuit_to_qasm_str(qc: QuantumCircuit) -> str:
     if qasm2_dumps is not None:
         return qasm2_dumps(qc)
     # Fallback for older Qiskit
-    return qc.qasm()  # type: ignore[attr-defined]
+    return qc.qasm()
 
 
 def circuit_from_qasm_str(qasm_str: str) -> QuantumCircuit:
@@ -235,7 +235,7 @@ def circuit_from_qasm_str(qasm_str: str) -> QuantumCircuit:
     if qasm2_loads is not None:
         return qasm2_loads(qasm_str)
     # Fallback for older Qiskit
-    return QuantumCircuit.from_qasm_str(qasm_str)  # type: ignore[attr-defined]
+    return QuantumCircuit.from_qasm_str(qasm_str)
 
 
 def generate_product_state_dataset(

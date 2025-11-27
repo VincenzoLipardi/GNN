@@ -9,24 +9,24 @@ import numpy as np
 
 # Optional heavy imports used by SRE computation helpers
 try:
-    from itertools import product as _it_product  # type: ignore
-    from qiskit import QuantumCircuit as _QuantumCircuit  # type: ignore
-    from qiskit.quantum_info import Operator as _Operator  # type: ignore
+    from itertools import product as _it_product
+    from qiskit import QuantumCircuit as _QuantumCircuit
+    from qiskit.quantum_info import Operator as _Operator
     try:
         # Qiskit Aer may not be installed in some envs
-        from qiskit_aer import AerSimulator as _AerSimulator  # type: ignore
-        from qiskit_aer.noise import NoiseModel as _NoiseModel  # type: ignore
+        from qiskit_aer import AerSimulator as _AerSimulator
+        from qiskit_aer.noise import NoiseModel as _NoiseModel
         _HAS_AER = True
     except Exception:
-        _AerSimulator = None  # type: ignore
-        _NoiseModel = None  # type: ignore
+        _AerSimulator = None
+        _NoiseModel = None
         _HAS_AER = False
 except Exception:
-    _it_product = None  # type: ignore
-    _QuantumCircuit = None  # type: ignore
-    _Operator = None  # type: ignore
-    _AerSimulator = None  # type: ignore
-    _NoiseModel = None  # type: ignore
+    _it_product = None
+    _QuantumCircuit = None
+    _Operator = None
+    _AerSimulator = None
+    _NoiseModel = None
     _HAS_AER = False
 
 
@@ -38,12 +38,12 @@ def stabilizer_renyi_entropy_ideal(qc: "_QuantumCircuit", alpha: int = 2) -> flo
     # Try reusing the implementation in label.py if present (absolute import; this
     # module is not a package, so relative import may fail)
     try:
-        from label import calculate_stabilizer_renyi_entropy_qiskit as _calc_sre  # type: ignore
+        from label import calculate_stabilizer_renyi_entropy_qiskit as _calc_sre
         return float(_calc_sre(qc, alpha=alpha))
     except Exception:
         try:
             # Best-effort relative import if run within a package context
-            from .label import calculate_stabilizer_renyi_entropy_qiskit as _calc_sre  # type: ignore
+            from .label import calculate_stabilizer_renyi_entropy_qiskit as _calc_sre
             return float(_calc_sre(qc, alpha=alpha))
         except Exception:
             pass
@@ -61,7 +61,7 @@ def stabilizer_renyi_entropy_ideal(qc: "_QuantumCircuit", alpha: int = 2) -> flo
         'Z': np.array([[1, 0], [0, -1]], dtype=complex),
     }
     # Build statevector once
-    from qiskit.quantum_info import Statevector as _Statevector  # type: ignore
+    from qiskit.quantum_info import Statevector as _Statevector
     sv = _Statevector(qc)
     A = 0.0
     for combo in _it_product(('I', 'X', 'Y', 'Z'), repeat=n):
@@ -79,7 +79,6 @@ def estimate_stabilizer_renyi_entropy_on_backend(
     qc: "_QuantumCircuit",
     backend,
     alpha: int = 2,
-    shots: int = 10000,
 ) -> float:
     """Estimate SRE using a noisy backend by simulating its noise model.
 
@@ -88,11 +87,11 @@ def estimate_stabilizer_renyi_entropy_on_backend(
     products and plug into the SRE definition. For α=2 this is efficient for
     up to 6 qubits (4^n terms = 4096 at n=6).
 
-    If Aer is unavailable, falls back to the ideal estimator.
+    Requires qiskit-aer; raises RuntimeError if unavailable.
     """
     if not _HAS_AER:
-        # Fallback: no Aer available; return ideal value to avoid crashing
-        return stabilizer_renyi_entropy_ideal(qc, alpha=alpha)
+        # Do not fallback to ideal; surface the error to caller
+        raise RuntimeError("Aer simulator not available; cannot perform noisy simulation")
 
     # Strip final measurements to avoid collapse when computing the density matrix
     def _strip_measurements(c: "_QuantumCircuit") -> "_QuantumCircuit":
@@ -112,27 +111,25 @@ def estimate_stabilizer_renyi_entropy_on_backend(
         circ.save_density_matrix()
     except Exception:
         try:
-            from qiskit_aer.library import save_density_matrix as _save_dm  # type: ignore
+            from qiskit_aer.library import save_density_matrix as _save_dm
             circ.append(_save_dm(), [])
         except Exception:
-            return stabilizer_renyi_entropy_ideal(qc, alpha=alpha)
+            raise RuntimeError("Failed to enable density matrix saving for Aer simulation")
 
     # Build an Aer simulator with the backend's noise model and density-matrix method
     try:
         noise_model = _NoiseModel.from_backend(backend) if _NoiseModel is not None else None
         sim = _AerSimulator(method='density_matrix', noise_model=noise_model)
     except Exception:
-        # If we fail to configure noise/model, fallback to ideal
-        return stabilizer_renyi_entropy_ideal(qc, alpha=alpha)
+        raise RuntimeError("Failed to configure Aer simulator or noise model")
 
-    from qiskit import transpile as _transpile  # type: ignore
+    from qiskit import transpile as _transpile  
     tcirc = _transpile(circ, sim)
     result = sim.run(tcirc, shots=1).result()
     try:
         rho = result.data(0)['density_matrix']
     except Exception:
-        # As a fallback, try to use statevector and degrade gracefully
-        return stabilizer_renyi_entropy_ideal(qc, alpha=alpha)
+        raise RuntimeError("Failed to obtain density matrix from Aer simulation result")
 
     # Ensure rho is ndarray
     rho = np.asarray(rho, dtype=complex)
@@ -150,6 +147,109 @@ def estimate_stabilizer_renyi_entropy_on_backend(
         for c in combo[1:]:
             op = np.kron(op, single[c])
         # Tr(ρ P)
+        exp_val = float(np.trace(rho @ op).real)
+        xi_p = (1.0 / d) * (exp_val ** 2)
+        A += xi_p ** alpha
+
+    entropy = (1.0 / (1 - alpha)) * float(np.log(A)) - float(np.log(d))
+    return float(entropy)
+
+
+def estimate_stabilizer_renyi_entropy_on_backend_native(
+    qc: "_QuantumCircuit",
+    backend,
+    alpha: int = 2,
+    optimization_level: int = 3,
+) -> float:
+    """Estimate SRE using a noisy backend after transpiling to its native gate set.
+
+    Steps:
+    1) Remove final measurements so the final state is not collapsed.
+    2) Transpile circuit for the provided backend (basis/coupling).
+    3) Append an instruction to save the density matrix.
+    4) Transpile for Aer density-matrix simulator configured with backend's noise.
+    5) Simulate once to obtain ρ, then compute SRE via Pauli moments.
+
+    Notes:
+    - Requires qiskit-aer; raises RuntimeError if unavailable.
+    """
+    if not _HAS_AER:
+        raise RuntimeError("Aer simulator not available; cannot perform noisy simulation")
+
+    if _QuantumCircuit is None:
+        raise RuntimeError("Qiskit not available to compute SRE")
+
+    # 1) Strip measurements
+    def _strip_measurements(c: "_QuantumCircuit") -> "_QuantumCircuit":
+        new_circ = _QuantumCircuit(*c.qregs, *c.cregs, name=c.name)
+        for instr, qargs, cargs in c.data:
+            if instr.name in ("measure",):
+                continue
+            new_circ.append(instr, qargs, cargs)
+        return new_circ
+
+    base = _strip_measurements(qc)
+
+    # 2) Transpile for the backend's native gates/coupling
+    try:
+        from qiskit import transpile as _transpile
+        native = _transpile(base, backend=backend, optimization_level=optimization_level)
+    except Exception:
+        # Fallback: try minimal transpile without backend (best-effort)
+        native = base
+
+    # 3) Save density matrix (added post-native mapping to avoid target validation issues)
+    try:
+        native.save_density_matrix()
+    except Exception:
+        try:
+            from qiskit_aer.library import save_density_matrix as _save_dm
+            native.append(_save_dm(), [])
+        except Exception:
+            raise RuntimeError("Failed to enable density matrix saving for Aer simulation")
+
+    # 4) Configure Aer simulator with backend's noise and transpile for the simulator target
+    try:
+        noise_model = _NoiseModel.from_backend(backend) if _NoiseModel is not None else None
+        sim = _AerSimulator(method='density_matrix', noise_model=noise_model)
+    except Exception:
+        raise RuntimeError("Failed to configure Aer simulator or noise model")
+
+    try:
+        tcirc = _transpile(native, sim)
+    except Exception:
+        tcirc = native
+
+    # 5) Run single-shot and compute SRE from ρ
+    result = sim.run(tcirc, shots=1).result()
+    try:
+        rho = result.data(0)['density_matrix']
+    except Exception:
+        raise RuntimeError("Failed to obtain density matrix from Aer simulation result")
+
+    # Infer qubit count from the density matrix shape to handle backend-native mapping
+    rho = np.asarray(rho, dtype=complex)
+    if rho.ndim != 2 or rho.shape[0] != rho.shape[1]:
+        raise RuntimeError("Density matrix is not square")
+    dim = int(rho.shape[0])
+    # Ensure dim is a power of two
+    n = int(np.round(np.log2(dim)))
+    if 2 ** n != dim:
+        raise RuntimeError(f"Unexpected density matrix dimension {dim}; not a power of 2")
+    d = float(dim)
+
+    single = {
+        'I': np.array([[1, 0], [0, 1]], dtype=complex),
+        'X': np.array([[0, 1], [1, 0]], dtype=complex),
+        'Y': np.array([[0, -1j], [1j, 0]], dtype=complex),
+        'Z': np.array([[1, 0], [0, -1]], dtype=complex),
+    }
+
+    A = 0.0
+    for combo in _it_product(('I', 'X', 'Y', 'Z'), repeat=n):
+        op = single[combo[0]]
+        for c in combo[1:]:
+            op = np.kron(op, single[c])
         exp_val = float(np.trace(rho @ op).real)
         xi_p = (1.0 / d) * (exp_val ** 2)
         A += xi_p ** alpha

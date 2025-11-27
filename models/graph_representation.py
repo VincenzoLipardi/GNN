@@ -96,8 +96,10 @@ def get_global_feature_dim(variant: str) -> int:
     if v == "binned152":
         return 152
     if v == "oslo":
-        # 50 bins for RZ + 3 counts (sx, x, ecr)
-        return 53
+        # 3 scalar headers (depth, num_qubits, total_gates)
+        # + 50 bins for RZ
+        # + 3 counts (sx, x, ecr)
+        return 56
     # baseline
     return 8
 
@@ -429,9 +431,13 @@ def _global_features_oslo(circuit: QuantumCircuit, num_qubits: int) -> Tensor:
     sx_count = 0.0
     x_count = 0.0
     ecr_count = 0.0
+    total_gates = 0.0
 
     for instr in getattr(circuit, 'data', []):
         name = instr.operation.name.lower()
+        if name == "barrier":
+            continue
+        total_gates += 1.0
         if name == "rz":
             params = getattr(instr.operation, 'params', [])
             if not params:
@@ -448,8 +454,11 @@ def _global_features_oslo(circuit: QuantumCircuit, num_qubits: int) -> Tensor:
         elif name == "ecr":
             ecr_count += 1.0
 
+    # Add compact header to assist extrapolation across qubit counts
+    depth = float(circuit.depth()) if hasattr(circuit, "depth") else float(total_gates)
+    header = torch.tensor([depth, float(num_qubits), float(total_gates)], dtype=torch.float)
     tail = torch.tensor([sx_count, x_count, ecr_count], dtype=torch.float)
-    return torch.cat([rz_bins, tail], dim=0)
+    return torch.cat([header, rz_bins, tail], dim=0)
 
 
 def qasm_to_pyg_graph(

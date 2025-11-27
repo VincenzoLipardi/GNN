@@ -5,16 +5,20 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 BASE_DATASET_PATH = \
-    "/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_18.pkl"
+    "/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_11_25.pkl"
 SRE_STATS_PATH = \
-    "/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_18_sre_stats.pkl"
+    "/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_11_25_sre_stats.pkl"
 EVOLVED_DATASET_PATH = \
-    "/data/P70087789/GNN/data/dataset_classification/dataset_type/clifford_evolved_18.pkl"
+    "/data/P70087789/GNN/data/dataset_classification/dataset_type/clifford_evolved_11_25.pkl"
+
+# Global threshold source (median of SRE values from 2-10 balanced stats)
+GLOBAL_THRESHOLD_STATS_PATH = \
+    "/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_2_10_balanced_by_sre_stats.pkl"
 
 OUTPUT_BASE_BALANCED_PATH = \
-    "/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_18_balanced_by_sre.pkl"
+    "/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_11_25_balanced_by_sre.pkl"
 OUTPUT_EVOLVED_BALANCED_PATH = \
-    "/data/P70087789/GNN/data/dataset_classification/dataset_type/clifford_evolved_18_balanced_by_sre.pkl"
+    "/data/P70087789/GNN/data/dataset_classification/dataset_type/clifford_evolved_11_25_balanced_by_sre.pkl"
 
 
 def load_pickle(path: str) -> Any:
@@ -87,9 +91,27 @@ def build_base_index_to_sre(sre_stats_obj: Any) -> List[Optional[float]]:
     raise ValueError("Unrecognized SRE stats format; expected dict or list/tuple")
 
 
+def _count_labels(dataset: Sequence[Tuple[Dict[str, Any], int]]) -> Tuple[int, int]:
+    count_zero = 0
+    count_one = 0
+    for item in dataset:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            label = int(item[1])
+        except Exception:
+            continue
+        if label == 0:
+            count_zero += 1
+        elif label == 1:
+            count_one += 1
+    return count_zero, count_one
+
+
 def relabel_balanced_by_sre_for_product(
     dataset_path: str,
     sre_stats_path: str,
+    override_threshold: Optional[float] = None,
 ) -> Tuple[List[Tuple[Dict[str, Any], int]], float]:
     data: Sequence[Tuple[Dict[str, Any], int]] = load_pickle(dataset_path)
     sre_stats = load_pickle(sre_stats_path)
@@ -115,7 +137,7 @@ def relabel_balanced_by_sre_for_product(
     if not sre_values:
         raise RuntimeError("No SRE values found for label=1 items in base dataset.")
 
-    threshold = float(statistics.median(sre_values))
+    threshold = float(override_threshold) if override_threshold is not None else float(statistics.median(sre_values))
 
     balanced: List[Tuple[Dict[str, Any], int]] = []
     for idx in filtered_indices:
@@ -143,6 +165,7 @@ def relabel_balanced_by_sre_for_evolved(
     evolved_path: str,
     base_dataset_path: str,
     base_sre: List[Optional[float]],
+    override_threshold: Optional[float] = None,
 ) -> Tuple[List[Tuple[Dict[str, Any], int]], float]:
     base_data: Sequence[Tuple[Dict[str, Any], int]] = load_pickle(base_dataset_path)
     evolved: Sequence[Tuple[Dict[str, Any], int]] = load_pickle(evolved_path)
@@ -166,7 +189,7 @@ def relabel_balanced_by_sre_for_evolved(
     if not sre_values:
         raise RuntimeError("No SRE values found for label=1 items in evolved dataset.")
 
-    threshold = float(statistics.median(sre_values))
+    threshold = float(override_threshold) if override_threshold is not None else float(statistics.median(sre_values))
 
     balanced: List[Tuple[Dict[str, Any], int]] = []
     for idx, item in enumerate(evolved):
@@ -187,22 +210,71 @@ def relabel_balanced_by_sre_for_evolved(
 
 
 def main() -> None:
-    print("Loading base dataset and SRE stats...")
+    # Print current ratio in the existing balanced file (if present)
+    if os.path.exists(OUTPUT_BASE_BALANCED_PATH):
+        try:
+            current_balanced = load_pickle(OUTPUT_BASE_BALANCED_PATH)
+            c0, c1 = _count_labels(current_balanced)
+            ratio_str = (f"{c0/float(c1):.6f}" if c1 > 0 else "inf")
+            print(
+                f"Current 11-25 balanced file label counts -> 0: {c0}, 1: {c1}, ratio 0/1: {ratio_str}"
+            )
+        except Exception as e:
+            print(f"Warning: failed to read existing balanced file: {e}")
+    else:
+        print("No existing 11-25 balanced file found; skipping current ratio print.")
+
+    # Compute global median threshold from 2-10 balanced SRE stats
+    print("Loading global SRE stats from 2-10 balanced file for median threshold...")
+    global_stats_obj = load_pickle(GLOBAL_THRESHOLD_STATS_PATH)
+
+    def _coerce_global_values(obj: Any) -> List[float]:
+        if isinstance(obj, dict):
+            vals: List[float] = []
+            for v in obj.values():
+                ev = extract_sre_total(v)
+                if ev is not None:
+                    vals.append(float(ev))
+            return vals
+        if isinstance(obj, (list, tuple)):
+            vals = []
+            for v in obj:
+                if isinstance(v, (int, float)):
+                    vals.append(float(v))
+                else:
+                    ev = extract_sre_total(v)
+                    if ev is not None:
+                        vals.append(float(ev))
+            return vals
+        ev = extract_sre_total(obj)
+        return [float(ev)] if ev is not None else []
+
+    global_values = _coerce_global_values(global_stats_obj)
+    if not global_values:
+        raise RuntimeError("No valid SRE values found in global threshold stats file.")
+    global_threshold = float(statistics.median(global_values))
+    print(f"Using global median SRE threshold (from 2-10): {global_threshold:.6f}")
+
+    print("Relabeling base 11-25 dataset with global threshold...")
     base_balanced, base_threshold = relabel_balanced_by_sre_for_product(
-        BASE_DATASET_PATH, SRE_STATS_PATH
+        BASE_DATASET_PATH, SRE_STATS_PATH, override_threshold=global_threshold
     )
-    print(f"Base median SRE threshold: {base_threshold:.6f}")
     print(f"Saving balanced base dataset to: {OUTPUT_BASE_BALANCED_PATH}")
     save_pickle(base_balanced, OUTPUT_BASE_BALANCED_PATH)
     print(f"Balanced base dataset size: {len(base_balanced)}")
+    # Print new ratio after overwrite
+    nb0, nb1 = _count_labels(base_balanced)
+    new_ratio_str = (f"{nb0/float(nb1):.6f}" if nb1 > 0 else "inf")
+    print(
+        f"New 11-25 balanced file label counts -> 0: {nb0}, 1: {nb1}, ratio 0/1: {new_ratio_str}"
+    )
 
-    print("Preparing evolved dataset relabeling...")
+    print("Relabeling evolved 11-25 dataset with global threshold...")
     sre_stats = load_pickle(SRE_STATS_PATH)
     base_sre = build_base_index_to_sre(sre_stats)
     evolved_balanced, evolved_threshold = relabel_balanced_by_sre_for_evolved(
-        EVOLVED_DATASET_PATH, BASE_DATASET_PATH, base_sre
+        EVOLVED_DATASET_PATH, BASE_DATASET_PATH, base_sre, override_threshold=global_threshold
     )
-    print(f"Evolved median SRE threshold: {evolved_threshold:.6f}")
     print(f"Saving balanced evolved dataset to: {OUTPUT_EVOLVED_BALANCED_PATH}")
     save_pickle(evolved_balanced, OUTPUT_EVOLVED_BALANCED_PATH)
     print(f"Balanced evolved dataset size: {len(evolved_balanced)}")

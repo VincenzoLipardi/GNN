@@ -18,12 +18,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Reuse dataset selection and results I/O helpers from gnn_run
+# Reuse dataset selection from gnn_run and results I/O from models.svr_results
 from gnn_run import (
     select_random_pkls,
     select_tim_pkls,
+)
+from models.svr_results import (
     load_all_svr_results,
     save_svr_results_for_experiment,
+    get_svr_results_path,
 )
 from models.gnn import (
     build_train_val_test_loaders_two_stage,
@@ -33,10 +36,10 @@ from models.gnn import (
 
 CONFIG: Dict[str, Any] = {
     # Data dirs
-    "random_noisy_dir": "/data/P70087789/GNN/data/dataset_random_noisy",
-    "tim_noisy_dir": "/data/P70087789/GNN/data/dataset_tim_noisy",
-    "random_base_dir": "/data/P70087789/GNN/data/dataset_random",
-    "tim_base_dir": "/data/P70087789/GNN/data/dataset_tim",
+    "random_noisy_dir": "/data/P70087789/GNN/data/dataset_regression/dataset_random_oslo",
+    "tim_noisy_dir": "/data/P70087789/GNN/data/dataset_regression/dataset_tim_oslo",
+    "random_base_dir": "/data/P70087789/GNN/data/dataset_regression/dataset_random",
+    "tim_base_dir": "/data/P70087789/GNN/data/dataset_regression/dataset_tim",
     "results_dir": "/data/P70087789/GNN/models/results",
 
     # Features/training
@@ -238,7 +241,7 @@ def main() -> None:
     if qubits_noisy is not None:
         save_svr_results_for_experiment(cfg["results_dir"], "qubits_noisy", qubits_noisy)
 
-    out_path = os.path.join(cfg["results_dir"], "svr_resuls.pkl")
+    out_path = get_svr_results_path(cfg["results_dir"])
     out = {
         "saved_to": out_path,
         "keys_now": list((load_all_svr_results(cfg["results_dir"]) or {}).keys()),

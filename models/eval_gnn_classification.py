@@ -36,12 +36,12 @@ except Exception:
 
 MODELS_DIR = "/data/P70087789/GNN/data/dataset_classification/models"
 RESULTS_DIR = "/data/P70087789/GNN/data/dataset_classification/results"
-MODEL_PATH_DEFAULT = os.path.join(MODELS_DIR, "model_product_states_18_balanced_by_sre.pt")
+MODEL_PATH_DEFAULT = os.path.join(MODELS_DIR, "model_product_states_2_10_balanced_by_sre.pt")
 DATASETS_DEFAULT = [
 	#"/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_11_25.pkl",
 	#"/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_18.pkl",
 	#"/data/P70087789/GNN/data/dataset_classification/dataset_type/entangled_11_25.pkl",
-	"/data/P70087789/GNN/data/dataset_classification/dataset_type/clifford_evolved_18_balanced_by_sre.pkl",
+	"/data/P70087789/GNN/data/dataset_classification/dataset_type/product_states_11_25_balanced_by_sre.pkl",
 	
 	
 ]

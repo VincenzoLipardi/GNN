@@ -13,9 +13,9 @@ import matplotlib.pyplot as plt
 from qiskit import QuantumCircuit
 
 try:
-    from qiskit.qasm2 import loads as qasm2_loads  # type: ignore
+    from qiskit.qasm2 import loads as qasm2_loads
 except Exception:
-    qasm2_loads = None  # type: ignore
+    qasm2_loads = None
 
 
 # Expected datasets (filename, human label)
@@ -46,7 +46,7 @@ PATTERNS: Dict[str, re.Pattern[str]] = {
 def _circuit_from_qasm(qasm_str: str) -> QuantumCircuit:
     """Load a circuit from QASM compatible with Qiskit 1.x and older."""
     if qasm2_loads is not None:
-        return qasm2_loads(qasm_str)  # type: ignore[misc]
+        return qasm2_loads(qasm_str)
     return QuantumCircuit.from_qasm_str(qasm_str)
 
 
@@ -58,7 +58,7 @@ def _extract_qasm(item: object) -> str:
         info = item
     if not isinstance(info, dict) or "qasm" not in info:
         raise ValueError("Unexpected dataset entry format; expected dict with 'qasm' or (dict, label)")
-    return str(info["qasm"])  # type: ignore[index]
+    return str(info["qasm"])
 
 
 def count_gates_in_qasm(qasm: str) -> Tuple[int, int, int, int]:
@@ -147,7 +147,7 @@ def plot_gate_statistics(base_dir: str, out_path: str, json_path: Optional[str] 
     means: List[np.ndarray] = []  # each shape (4,)
     stds: List[np.ndarray] = []   # each shape (4,)
     results_json: Dict[str, object] = {"datasets": {}} if json_path is None else _read_json(json_path)
-    datasets_json: Dict[str, object] = results_json.setdefault("datasets", {})  # type: ignore[assignment]
+    datasets_json: Dict[str, object] = results_json.setdefault("datasets", {})
     ns: List[int] = []
     paths_list: List[str] = []
 

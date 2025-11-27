@@ -96,7 +96,7 @@ def main() -> None:
 
     # 1) Loss curves
     loss_hist = data.get("loss_history", {}) if isinstance(data, dict) else {}
-    epochs, train_loss, val_loss = _extract_loss(loss_hist)  # type: ignore[arg-type]
+    epochs, train_loss, val_loss = _extract_loss(loss_hist)
     if epochs and train_loss and val_loss:
         loss_out = os.path.join(IMAGES_DIR, "training_loss.png")
         out1 = plot_loss_curve(epochs, train_loss, val_loss, loss_out)
@@ -117,8 +117,8 @@ def main() -> None:
         test_cm_dict = train_cm_dict
 
     if train_cm_dict and test_cm_dict:
-        train_cm = _dict_cm_to_array(train_cm_dict)  # type: ignore[arg-type]
-        test_cm = _dict_cm_to_array(test_cm_dict)    # type: ignore[arg-type]
+        train_cm = _dict_cm_to_array(train_cm_dict)
+        test_cm = _dict_cm_to_array(test_cm_dict)
         cm_out = os.path.join(IMAGES_DIR, "confusion_matrix.png")
         out2 = plot_confusion_matrices(train_cm, test_cm, cm_out)
         print(f"Saved confusion matrices to: {out2}")

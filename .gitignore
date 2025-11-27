@@ -3,15 +3,17 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-*.json
-
 # C extensions
 *.so
 # directories
 data/dataset_random/
 data/dataset_tim/
+# Files
+*.pt
 *.pkl
+*.json
 *.png
+*.csv
 
 # Distribution / packaging
 .Python
