@@ -151,9 +151,6 @@ The classification workflow and plots live under `data/dataset_classification/`.
     ```
   - Output figure is saved to `data/dataset_classification/images/`.
 
-Other helpers:
-- `plot_accuracy.py`, `plot_training.py`, `plot_sre_density.py`, `plot_sre_boxplot.py`, `plot_gate_stats.py`
-- `new_classification_task.py`, `data_classification.py`, `sre_calculation.py`
 
 
 ## Reproducibility
@@ -161,16 +158,9 @@ Other helpers:
 - For exact reproducibility across GPUs/CPUs, consider disabling CuDNN benchmarking and pinning package versions.
 
 
-## Dependencies (summary)
-- Core: torch, torch_geometric, numpy, scipy
-- Visualization: matplotlib, seaborn
-- Quantum circuit tooling: pennylane (and optionally `pennylane-lightning`), qiskit
-- Optional baselines/analysis: scikit-learn
 
 
 ## License
 See `LICENSE` for details.
 
 
-## Citation
-If you use this repository in academic work related to “Nonstabilizerness Estimation using Graph Neural Networks”, please cite or reference it appropriately. A BibTeX entry can be added here once available.
